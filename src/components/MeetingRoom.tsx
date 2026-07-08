@@ -2171,11 +2171,10 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                 <span>REC</span>
               </div>
             )}
-            <div className="text-xs text-slate-200 font-mono flex items-center gap-1.5" title="Call duration">
-              <Clock className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
-              <span>{formatDuration(callDuration)}</span>
-              <span className="text-[10px] text-amber-400 font-medium">
-                ({formatDuration(Math.max(0, (meetingState?.duration && meetingState.duration > 0 ? Math.min(meetingState.duration, 60) : 60) * 60 - callDuration))} left)
+            <div className="text-xs text-amber-400 font-mono flex items-center gap-1.5 font-medium" title="Time remaining">
+              <Clock className="w-3.5 h-3.5 animate-pulse" />
+              <span>
+                {formatDuration(Math.max(0, (meetingState?.duration && meetingState.duration > 0 ? Math.min(meetingState.duration, 60) : 60) * 60 - callDuration))} left
               </span>
             </div>
           </div>
@@ -3010,7 +3009,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
             className="text-xs text-slate-300 font-semibold font-mono flex items-center gap-1.5 hover:text-white transition-colors cursor-pointer"
             title="View participants list"
           >
-            <span>{activeParticipants.length + 1} present</span>
+            <span>{activeParticipants.length + 1}</span>
           </button>
 
 
