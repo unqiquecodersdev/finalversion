@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Allow read & write across all collections during sandbox development to handle both actual and offline bypassed credentials flawlessly.
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

@@ -1,0 +1,209 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User account information and roles",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "User identifier"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address"
+        },
+        "name": {
+          "type": "string",
+          "description": "Full name"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["student", "teacher", "admin"],
+          "description": "System role"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Account registration timestamp"
+        }
+      },
+      "required": ["uid", "email", "name", "role", "createdAt"]
+    },
+    "Classroom": {
+      "title": "Educational Classroom",
+      "description": "A group classroom folder representing a class",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Classroom unique identifier"
+        },
+        "name": {
+          "type": "string",
+          "description": "Name of the class"
+        },
+        "description": {
+          "type": "string",
+          "description": "A brief description"
+        },
+        "teacherId": {
+          "type": "string",
+          "description": "UID of the teaching host"
+        },
+        "teacherName": {
+          "type": "string",
+          "description": "Full name of the teacher"
+        },
+        "code": {
+          "type": "string",
+          "description": "A short alphanumeric join code for students"
+        },
+        "studentIds": {
+          "type": "array",
+          "description": "Joined student IDs"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        }
+      },
+      "required": ["id", "name", "teacherId", "teacherName", "code", "studentIds", "createdAt"]
+    },
+    "Meeting": {
+      "title": "Class Meeting",
+      "description": "An interactive live class session or scheduled meeting",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Meeting unique identifier"
+        },
+        "classroomId": {
+          "type": "string",
+          "description": "Associated classroom identifier"
+        },
+        "classroomName": {
+          "type": "string",
+          "description": "Name of the associated classroom"
+        },
+        "title": {
+          "type": "string",
+          "description": "Topic of the class session"
+        },
+        "description": {
+          "type": "string",
+          "description": "Meeting detailed description"
+        },
+        "discussionMaterial": {
+          "type": "string",
+          "description": "Material uploaded by teacher for AI quiz and review"
+        },
+        "scheduledAt": {
+          "type": "string",
+          "description": "Scheduled time"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["scheduled", "active", "ended"],
+          "description": "Session status"
+        },
+        "quizzes": {
+          "type": "array",
+          "description": "AI generated multiple choice questions for local live call"
+        },
+        "recordedQuizzes": {
+          "type": "array",
+          "description": "Alternative unique randomized quizzes for missed recorded session"
+        },
+        "hostId": {
+          "type": "string",
+          "description": "Teacher UID"
+        },
+        "hostName": {
+          "type": "string",
+          "description": "Teacher's display name"
+        },
+        "aiSummary": {
+          "type": "string",
+          "description": "Automatically calculated AI meeting performance summary"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Meeting creation date"
+        }
+      },
+      "required": ["id", "classroomId", "classroomName", "title", "status", "hostId", "hostName", "createdAt"]
+    },
+    "MeetingResponse": {
+      "title": "Student Interaction Log",
+      "description": "Student tracking log during active live meeting or recording playback",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique response identifier"
+        },
+        "meetingId": {
+          "type": "string",
+          "description": "Target meeting ID"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Student participant ID"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Student user display name"
+        },
+        "activePopupShown": {
+          "type": "integer",
+          "description": "Random availability checks shown"
+        },
+        "activePopupClicked": {
+          "type": "integer",
+          "description": "Availability checks successfully clicked"
+        },
+        "quizAnswers": {
+          "type": "array",
+          "description": "Student answers submitted during class"
+        },
+        "overallPercentage": {
+          "type": "integer",
+          "description": "Resulting percentage grade 1-100"
+        },
+        "missedLive": {
+          "type": "boolean",
+          "description": "True if participant completed asynchronous recorded class"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last updated"
+        }
+      },
+      "required": ["id", "meetingId", "userId", "userName", "activePopupShown", "activePopupClicked", "quizAnswers", "overallPercentage", "missedLive", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Collection of user application roles and metadata"
+    },
+    "/classrooms/{classroomId}": {
+      "schema": "Classroom",
+      "description": "Collection of educational classroom groups"
+    },
+    "/meetings/{meetingId}": {
+      "schema": "Meeting",
+      "description": "Online class meeting scheduled/ended items"
+    },
+    "/meetings/{meetingId}/responses/{responseId}": {
+      "schema": "MeetingResponse",
+      "description": "Individual student interactive stats logs for class"
+    }
+  }
+}

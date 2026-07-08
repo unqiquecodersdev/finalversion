@@ -1,0 +1,6 @@
+{
+  "name": "EduClass Meet",
+  "description": "An interactive online meeting platform designed for educational classrooms, featuring AI-generated quizzes, random availability checks, automated participant score calculations, and asynchronous replay modes.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
