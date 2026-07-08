@@ -3,6 +3,7 @@ import path from "path";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import fs from "fs";
 
 dotenv.config();
 
@@ -11,6 +12,34 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json());
+
+// Serve the recordings statically
+app.use("/recordings", express.static(path.join(process.cwd(), "recordings")));
+
+// Raw body parser endpoint for video uploads
+app.post("/api/upload-recording", express.raw({ type: "video/webm", limit: "100mb" }), (req, res) => {
+  const meetingId = req.query.meetingId;
+  if (!meetingId) {
+    return res.status(400).json({ error: "Missing meetingId parameter" });
+  }
+
+  try {
+    const dir = path.join(process.cwd(), "recordings");
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const filePath = path.join(dir, `${meetingId}.webm`);
+    fs.writeFileSync(filePath, req.body);
+    console.log(`[Upload] Saved recording for meeting ${meetingId} to ${filePath}`);
+    
+    return res.json({ success: true, url: `/recordings/${meetingId}.webm` });
+  } catch (err: any) {
+    console.error("[Upload Error]:", err);
+    return res.status(500).json({ error: err.message || "Failed to write recording file" });
+  }
+});
+
 
 // Initialize Gemini SDK with telemetry header
 const ai = new GoogleGenAI({
@@ -40,7 +69,7 @@ ${salt ? `Randomization Seed: ${salt}. Use this unique seed as an instruction to
 Generate exactly 5 questions. Make sure questions are highly educational, clear, and relevant. Each question must have an array of exactly 4 plausible options, and a valid zero-index correctAnswerIndex pointing to the right option.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
       config: {
         systemInstruction,
@@ -79,6 +108,7 @@ Generate exactly 5 questions. Make sure questions are highly educational, clear,
     const parsedQuizzes = JSON.parse(jsonText.trim());
     return res.json({ success: true, quizzes: parsedQuizzes });
   } catch (err: any) {
+    console.error("[Content Generation Error]:", err);
     console.log("[Content Generation] Operating in custom fallback mode for interactive quizzes.");
     
     const combinedText = `${title || ""} ${description || ""} ${discussionMaterial || ""}`.toLowerCase();
@@ -277,7 +307,7 @@ Generate exactly 5 questions. Make sure questions are highly educational, clear,
       ];
     }
 
-    return res.json({ success: true, quizzes: selectedQuizzes, error: "Local fallback active." });
+    return res.json({ success: true, quizzes: selectedQuizzes, error: `AI Generation Failed (${err.message}). Using local fallback quizzes.` });
   }
 });
 
@@ -304,7 +334,7 @@ The question must have:
 - category: e.g., "Active Recall" or "Live Concept Check"`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
       config: {
         systemInstruction,
@@ -395,7 +425,7 @@ The question must have:
       };
     }
 
-    return res.json({ success: true, quiz: defaultQuiz, error: "Local fallback active." });
+    return res.json({ success: true, quiz: defaultQuiz, error: `AI Generation Failed (${err.message}). Using local fallback quiz.` });
   }
 });
 
@@ -422,7 +452,7 @@ Please generate an interactive, beautifully worded overview of:
 Produce your response in clean Markdown formatting. Keep it inspiring, highly structured, and objective.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
     });
 
@@ -452,7 +482,7 @@ Produce your response in clean Markdown formatting. Keep it inspiring, highly st
     return res.json({
       success: true,
       summary: summaryMarkdown,
-      error: "Local fallback active."
+      error: `AI Summary Failed (${err.message}). Using local fallback summary.`
     });
   }
 });

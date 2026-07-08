@@ -113,12 +113,20 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
       }
 
       if (firebaseUser) {
+        // IMPORTANT: always use the Firebase UID — this is what gets stored in classrooms as teacherId
+        const firebaseUid = firebaseUser.uid;
+
         // Ensure the matching profile is placed and loaded from Firestore DB
         let profile: UserProfile | null = null;
         try {
-          const userDoc = await getDoc(doc(db, "users", firebaseUser.uid));
+          const userDoc = await getDoc(doc(db, "users", firebaseUid));
           if (userDoc && userDoc.exists()) {
             profile = userDoc.data() as UserProfile;
+            // Ensure the stored profile UID matches the Firebase UID (repair stale docs)
+            if (profile.uid !== firebaseUid) {
+              profile = { ...profile, uid: firebaseUid };
+              await setDoc(doc(db, "users", firebaseUid), profile);
+            }
           }
         } catch (dbReadErr) {
           console.warn("Failed reading Sandbox profile from Firestore, using client sync placeholder:", dbReadErr);
@@ -126,14 +134,14 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
 
         if (!profile) {
           profile = {
-            uid: firebaseUser.uid,
+            uid: firebaseUid,
             email: sandboxEmail,
             name: sandboxName,
             role: selectedRole,
             createdAt: new Date().toISOString(),
           };
           try {
-            await setDoc(doc(db, "users", firebaseUser.uid), profile);
+            await setDoc(doc(db, "users", firebaseUid), profile);
           } catch (dbWriteErr) {
             console.warn("Could not save new user profile to Firestore database:", dbWriteErr);
           }
@@ -146,17 +154,21 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
     } catch (err: any) {
       console.warn("Firebase Sandbox auth failed or is offline. Activating stable role-based fallback:", err);
       
-      // Generate or retrieve a consistent, non-random offline UID for testing continuity across refreshes
-      const stableOfflineKey = `offline_uid_${selectedRole}`;
-      let offlineUid = localStorage.getItem(stableOfflineKey);
-      if (!offlineUid) {
-        offlineUid = "offline_" + selectedRole + "_" + Math.floor(1000 + Math.random() * 9000);
-        localStorage.setItem(stableOfflineKey, offlineUid);
+      // Generate a STABLE offline UID using a simple deterministic approach.
+      // We use the role + a fixed suffix so the same UID is always produced for the same role.
+      // This prevents UID mismatch when localStorage is cleared.
+      const sandboxEmail = `${selectedRole}_sandbox@edumeet.internal`;
+      // Simple deterministic hash from email string — no randomness
+      let hash = 0;
+      for (let i = 0; i < sandboxEmail.length; i++) {
+        hash = ((hash << 5) - hash) + sandboxEmail.charCodeAt(i);
+        hash |= 0;
       }
+      const deterministicOfflineUid = `offline_${selectedRole}_${Math.abs(hash).toString(16)}`;
 
       const offlineProfile: UserProfile = {
-        uid: offlineUid,
-        email: `${selectedRole}_sandbox@edumeet.internal`,
+        uid: deterministicOfflineUid,
+        email: sandboxEmail,
         name: sandboxName + " (Offline Mode)",
         role: selectedRole,
         createdAt: new Date().toISOString()

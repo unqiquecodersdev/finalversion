@@ -17,17 +17,22 @@ const getDirectVideoUrl = (url: string, title?: string, description?: string): s
   if (!url) {
     const combined = `${title || ""} ${description || ""}`.toLowerCase();
     if (combined.includes("cell") || combined.includes("biology") || combined.includes("mitochondria") || combined.includes("photosynthesis") || combined.includes("chloroplast") || combined.includes("organelle") || combined.includes("science")) {
-      return "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"; // Nature/Flower
+      return "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
     } else if (combined.includes("code") || combined.includes("program") || combined.includes("javascript") || combined.includes("python") || combined.includes("software") || combined.includes("computer")) {
-      return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4"; // CGI tech
+      return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4";
     } else if (combined.includes("math") || combined.includes("calcul") || combined.includes("algebra") || combined.includes("number") || combined.includes("equation") || combined.includes("geometry")) {
-      return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"; // Clean animation
+      return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
     } else if (combined.includes("history") || combined.includes("century") || combined.includes("empire") || combined.includes("revolution") || combined.includes("renaissance")) {
-      return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4"; // Narrative
+      return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4";
     }
     return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4";
   }
-  
+
+  // Local server recording (e.g. /recordings/meet_abc.webm)
+  if (url.startsWith("/recordings/")) {
+    return url;
+  }
+
   // Handle Google Drive file link
   if (url.includes("drive.google.com")) {
     const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) || url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
@@ -36,6 +41,12 @@ const getDirectVideoUrl = (url: string, title?: string, description?: string): s
     }
   }
   return url;
+};
+
+/** Returns true when the URL points to an actual recorded file (not a fallback sample) */
+const isActualRecording = (url?: string): boolean => {
+  if (!url) return false;
+  return url.startsWith("/recordings/") || url.includes("drive.google.com");
 };
 
 export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, onClose }) => {
@@ -459,6 +470,7 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
   const visibleChats = chatMessages.slice(0, visibleCount);
 
   return (
+    <>
     <div className="bg-slate-900 border border-white/5 rounded-[32px] p-6 md:p-8 shadow-2xl text-slate-200 relative overflow-hidden">
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
@@ -473,7 +485,9 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
             <video
               ref={videoRef}
               src={getDirectVideoUrl(meeting.recordedVideoUrl || "", meeting.title, meeting.description)}
-              className="w-full h-full object-cover rounded-3xl absolute inset-0 z-0 opacity-80"
+              className={`w-full h-full rounded-3xl absolute inset-0 z-0 transition-opacity ${
+                isActualRecording(meeting.recordedVideoUrl) ? "object-contain opacity-100" : "object-cover opacity-75"
+              }`}
               onTimeUpdate={handleTimeUpdate}
               onEnded={() => {
                 setPlaying(false);
@@ -501,9 +515,13 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
 
             {/* Stage header info */}
             <div className="flex items-center justify-between z-10">
-              <div className="px-3 py-1 bg-indigo-950/85 backdrop-blur-md border border-indigo-900/50 text-indigo-300 font-mono text-[10px] uppercase tracking-wider rounded-lg flex items-center gap-1.5 font-bold">
-                <Clock className="w-3.5 h-3.5 animate-pulse text-indigo-400" />
-                <span>Recorded Class Broadcast</span>
+              <div className={`px-3 py-1 backdrop-blur-md font-mono text-[10px] uppercase tracking-wider rounded-lg flex items-center gap-1.5 font-bold border ${
+                isActualRecording(meeting.recordedVideoUrl)
+                  ? "bg-emerald-950/90 border-emerald-800/60 text-emerald-300"
+                  : "bg-indigo-950/85 border-indigo-900/50 text-indigo-300"
+              }`}>
+                <Clock className="w-3.5 h-3.5 animate-pulse" />
+                <span>{isActualRecording(meeting.recordedVideoUrl) ? "Live Class Recording" : "Demo Replay Mode"}</span>
               </div>
 
               <div className="flex items-center gap-3">
@@ -625,79 +643,6 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
             </div>
 
           </div>
-
-          {/* AI Quiz Panel right inside video layout */}
-          {currentQuiz && (
-            <div className="bg-slate-950 border border-indigo-500/20 p-6 md:p-8 rounded-3xl scale-in-animation shadow-2xl">
-              <div className="flex items-center gap-2 mb-4">
-                <Sparkles className="w-4 h-4 text-indigo-400 animate-pulse" />
-                <span className="text-[10px] font-mono tracking-widest text-slate-400 uppercase font-semibold">
-                  Active Timeline Quiz • Checkpoint {quizTriggerIndex + 1}
-                </span>
-              </div>
-
-              <h4 className="text-sm font-semibold text-slate-100 leading-relaxed mb-5">
-                {currentQuiz.question}
-              </h4>
-
-              <div className="space-y-2 mb-6">
-                {currentQuiz.options.map((opt, oIdx) => {
-                  const wasSelected = selectedOption === oIdx;
-                  return (
-                    <button
-                      key={oIdx}
-                      disabled={feedbackShown}
-                      onClick={() => setSelectedOption(oIdx)}
-                      className={`w-full text-left p-3.5 rounded-xl text-xs transition-all flex items-center justify-between border cursor-pointer ${
-                        wasSelected
-                          ? "bg-indigo-500/20 border-indigo-550 text-indigo-300 font-semibold"
-                          : "bg-slate-900 border-white/5 hover:bg-slate-800 text-slate-300"
-                      }`}
-                    >
-                      <span>{opt}</span>
-                      {feedbackShown && oIdx === currentQuiz.correctAnswerIndex && (
-                        <CheckCircle className="w-4 h-4 text-emerald-555" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {feedbackShown ? (
-                <div className="p-4 bg-slate-900 border border-white/5 rounded-xl mb-4 text-xs font-sans">
-                  {selectedOption === currentQuiz.correctAnswerIndex ? (
-                    <span className="text-emerald-400 font-bold flex items-center gap-1.5">
-                      <CheckCircle className="w-4 h-4" /> Smart choice! Accrued score registered on server.
-                    </span>
-                  ) : (
-                    <span className="text-rose-400 flex items-center gap-1.5 leading-relaxed font-semibold">
-                      <AlertCircle className="w-4 h-4 shrink-0 text-rose-550" /> Correct selection is: <b>{currentQuiz.options[currentQuiz.correctAnswerIndex]}</b>
-                    </span>
-                  )}
-                </div>
-              ) : null}
-
-              <div className="flex gap-2.5">
-                {!feedbackShown ? (
-                  <button
-                    onClick={submitQuizSelection}
-                    disabled={selectedOption === null}
-                    className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-550 disabled:opacity-40 text-white font-bold text-xs rounded-xl shadow-lg transition-all cursor-pointer"
-                  >
-                    Confirm Quiz Option
-                  </button>
-                ) : (
-                  <button
-                    onClick={handleNextLessonSegment}
-                    className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 text-slate-100 font-bold text-xs rounded-xl shadow border border-white/10 transition-all cursor-pointer flex items-center justify-center gap-1.5"
-                  >
-                    <span>Resume Replay Lesson</span>
-                    <ChevronRight className="w-3.5 h-3.5 text-indigo-400" />
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
 
         </div>
 
@@ -1001,5 +946,107 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
       </div>
 
     </div>
+
+    {/* ── Quiz Checkpoint Overlay Modal ── Appears on top of everything when a milestone is hit */}
+    {currentQuiz && !isTeacher && (
+      <div className="fixed inset-0 z-[9000] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-slate-900 border border-indigo-500/30 rounded-3xl p-7 md:p-10 w-full max-w-lg shadow-2xl scale-in-animation relative overflow-hidden">
+          {/* Decorative gradient */}
+          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-indigo-600 via-violet-500 to-indigo-600 rounded-t-3xl" />
+
+          <div className="flex items-center gap-2 mb-5">
+            <div className="w-8 h-8 rounded-xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center">
+              <Sparkles className="w-4 h-4 text-indigo-400 animate-pulse" />
+            </div>
+            <div>
+              <span className="text-[10px] font-mono tracking-widest text-indigo-400 uppercase font-bold block">
+                Checkpoint Quiz
+              </span>
+              <span className="text-[9px] font-mono text-slate-500">
+                {quizTriggerIndex + 1} of {quizzes.length} • Video paused
+              </span>
+            </div>
+          </div>
+
+          <h4 className="text-sm font-bold text-slate-100 leading-relaxed mb-6">
+            {currentQuiz.question}
+          </h4>
+
+          <div className="space-y-2.5 mb-6">
+            {currentQuiz.options.map((opt, oIdx) => {
+              const wasSelected = selectedOption === oIdx;
+              const isCorrectAnswer = oIdx === currentQuiz.correctAnswerIndex;
+              return (
+                <button
+                  key={oIdx}
+                  disabled={feedbackShown}
+                  onClick={() => setSelectedOption(oIdx)}
+                  className={`w-full text-left p-4 rounded-2xl text-xs transition-all flex items-center justify-between border cursor-pointer font-medium ${
+                    feedbackShown
+                      ? isCorrectAnswer
+                        ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
+                        : wasSelected && !isCorrectAnswer
+                        ? "bg-rose-500/15 border-rose-500/30 text-rose-300"
+                        : "bg-slate-800/50 border-white/5 text-slate-500"
+                      : wasSelected
+                      ? "bg-indigo-500/20 border-indigo-500/50 text-indigo-200 font-semibold"
+                      : "bg-slate-800/60 border-white/10 hover:bg-slate-800 text-slate-300"
+                  }`}
+                >
+                  <span>{opt}</span>
+                  {feedbackShown && isCorrectAnswer && (
+                    <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0 ml-2" />
+                  )}
+                  {feedbackShown && wasSelected && !isCorrectAnswer && (
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 ml-2" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {feedbackShown && (
+            <div className={`p-4 rounded-2xl mb-5 text-xs font-semibold flex items-start gap-2 ${
+              selectedOption === currentQuiz.correctAnswerIndex
+                ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-300"
+                : "bg-rose-500/10 border border-rose-500/20 text-rose-300"
+            }`}>
+              {selectedOption === currentQuiz.correctAnswerIndex ? (
+                <>
+                  <CheckCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>Correct! Great work. Your score has been saved to the server.</span>
+                </>
+              ) : (
+                <>
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>Incorrect. The correct answer is: <b className="text-rose-200">{currentQuiz.options[currentQuiz.correctAnswerIndex]}</b></span>
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="flex gap-3">
+            {!feedbackShown ? (
+              <button
+                onClick={submitQuizSelection}
+                disabled={selectedOption === null}
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold text-xs rounded-2xl shadow-lg shadow-indigo-600/20 transition-all cursor-pointer"
+              >
+                Submit Answer
+              </button>
+            ) : (
+              <button
+                onClick={handleNextLessonSegment}
+                className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-2xl shadow border border-white/10 transition-all cursor-pointer flex items-center justify-center gap-2"
+              >
+                <span>Resume Video</span>
+                <ChevronRight className="w-4 h-4 text-indigo-400" />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 };

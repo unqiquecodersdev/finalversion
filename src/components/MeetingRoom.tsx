@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { Meeting, UserProfile, MeetingResponse, QuizQuestion, StudentQuizSubmission } from "../types";
 import { db, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, addDoc, deleteDoc } from "../firebase";
 import { 
   Video, VideoOff, Mic, MicOff, PhoneOff, Users, MessageSquare, 
   Play, Pause, Award, AlertCircle, CheckCircle, HelpCircle, Sparkles, Send, Bell,
   Minimize2, Maximize2, FileCheck, Clock, LayoutGrid, LayoutTemplate, Monitor, LogOut,
-  Hand, Pin, Check, Trash, Settings
+  Hand, Pin, Trash, Settings
 } from "lucide-react";
 
 interface MeetingRoomProps {
@@ -32,6 +33,8 @@ interface ActiveParticipant {
   handRaised?: boolean;
   handRaisedAt?: string | null;
   lastActive?: string;
+  cameraStreamId?: string | null;
+  screenStreamId?: string | null;
 }
 
 const DEFAULT_MEETING_QUIZZES: QuizQuestion[] = [
@@ -70,9 +73,11 @@ const DEFAULT_MEETING_QUIZZES: QuizQuestion[] = [
   }
 ];
 
-// Helper sub-component to render live remote participant streams, 
+// Helper sub-component to render live remote participant streams,
 // using real WebRTC streams with beautiful virtual digitized fallback animations.
-const RemoteVideo = ({ p, stream }: { p: ActiveParticipant; stream?: MediaStream }) => {
+// Memoized so React skips re-render (and avoids video srcObject flicker) unless
+// the actual stream reference or participant state changes.
+const RemoteVideo = React.memo(({ p, stream }: { p: ActiveParticipant; stream?: MediaStream }) => {
   return (
     <div className="w-full h-full bg-slate-950 flex items-center justify-center relative overflow-hidden">
       {p.videoEnabled && stream ? (
@@ -126,11 +131,31 @@ const RemoteVideo = ({ p, stream }: { p: ActiveParticipant; stream?: MediaStream
           <div className="w-20 h-20 rounded-xl bg-slate-800 border border-white/10 flex items-center justify-center text-slate-350 font-bold text-2xl uppercase">
             {p.name.charAt(0)}
           </div>
+          {stream && (
+            <audio
+              ref={(el) => {
+                if (el && el.srcObject !== stream) {
+                  el.srcObject = stream;
+                }
+              }}
+              autoPlay
+              playsInline
+            />
+          )}
         </div>
       )}
     </div>
   );
-};
+}, (prev, next) => {
+  // Only re-render if the stream reference or relevant participant display fields change
+  return (
+    prev.stream === next.stream &&
+    prev.p.videoEnabled === next.p.videoEnabled &&
+    prev.p.micEnabled === next.p.micEnabled &&
+    prev.p.name === next.p.name &&
+    prev.p.id === next.p.id
+  );
+});
 
 export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave }) => {
   const isHost = user.role === "teacher" || user.uid === meeting.hostId;
@@ -140,36 +165,215 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   const [micEnabled, setMicEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null); // ref for stale-closure-safe access
 
   // WebRTC mesh synchronization states and signaling refs
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [remoteScreenStreams, setRemoteScreenStreams] = useState<Record<string, MediaStream>>({});
+  const remoteStreamsMapRef = useRef<Record<string, Set<MediaStream>>>({});
+  const activeParticipantsRef = useRef<ActiveParticipant[]>([]);
   const pcsRef = useRef<Record<string, RTCPeerConnection>>({});
+  // Stable ref to the screen stream to avoid stale closures in PC callbacks
+  const screenStreamRef2 = useRef<MediaStream | null>(null);
+  // Tracks which peer IDs have already gone through signaling setup (to detect fresh vs reconnect)
+  const initializedPeersRef = useRef<Set<string>>(new Set());
+  const pcsSignalingRef = useRef<Record<string, {
+    localCandidates: any[];
+    signalingDocExists: boolean;
+    addedRemoteCandidates: Set<string>;
+  }>>({});
+
+  const [rawParticipants, setRawParticipants] = useState<ActiveParticipant[]>([]);
+  const [presenceTicker, setPresenceTicker] = useState(0);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setPresenceTicker((p) => p + 1);
+    }, 4000);
+    return () => clearInterval(t);
+  }, []);
+
+  const activeParticipants = useMemo(() => {
+    const now = Date.now();
+    return rawParticipants.filter((p) => {
+      if (!p.lastActive) return true;
+      const diff = now - new Date(p.lastActive).getTime();
+      return diff <= 60000; // 60 seconds threshold (stale check for inactive participants)
+    });
+  }, [rawParticipants, presenceTicker]);
+
+  const setActiveParticipants = setRawParticipants;
+
+  const classifyStreams = () => {
+    const newRemoteStreams: Record<string, MediaStream> = {};
+    const newScreenStreams: Record<string, MediaStream> = {};
+
+    Object.keys(remoteStreamsMapRef.current).forEach((pId) => {
+      const streams = remoteStreamsMapRef.current[pId];
+      const p = activeParticipantsRef.current.find(part => part.id === pId);
+
+      streams.forEach((stream) => {
+        if (p && p.screenStreamId && stream.id === p.screenStreamId) {
+          newScreenStreams[pId] = stream;
+        } else {
+          newRemoteStreams[pId] = stream;
+        }
+      });
+    });
+
+    // Only update state if stream references actually changed — avoids unnecessary
+    // re-renders of RemoteVideo (which would cause the video element to blink).
+    setRemoteStreams((prev) => {
+      const prevKeys = Object.keys(prev);
+      const newKeys = Object.keys(newRemoteStreams);
+      if (
+        prevKeys.length === newKeys.length &&
+        newKeys.every((k) => prev[k] === newRemoteStreams[k])
+      ) {
+        return prev; // No change — keep same reference, skip re-render
+      }
+      return newRemoteStreams;
+    });
+
+    setRemoteScreenStreams((prev) => {
+      const prevKeys = Object.keys(prev);
+      const newKeys = Object.keys(newScreenStreams);
+      if (
+        prevKeys.length === newKeys.length &&
+        newKeys.every((k) => prev[k] === newScreenStreams[k])
+      ) {
+        return prev;
+      }
+      return newScreenStreams;
+    });
+  };
 
   const getOrCreatePC = (pId: string) => {
     if (pcsRef.current[pId]) {
       return pcsRef.current[pId];
     }
 
+    if (!pcsSignalingRef.current[pId]) {
+      pcsSignalingRef.current[pId] = {
+        localCandidates: [],
+        signalingDocExists: false,
+        addedRemoteCandidates: new Set()
+      };
+    }
+    const sigState = pcsSignalingRef.current[pId];
+
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" }
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        {
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject"
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject"
+        }
       ]
     });
 
-    if (localStream) {
-      localStream.getTracks().forEach((track) => {
-        pc.addTrack(track, localStream);
+    const isInitiator = user.uid < pId;
+    const isPolite = user.uid > pId;
+    const channelId = user.uid < pId ? `${user.uid}_${pId}` : `${pId}_${user.uid}`;
+    const docRef = doc(db, `meetings/${meeting.id}/webrtc`, channelId);
+
+    // Use refs (not state) so the track-addition sees the current stream, not the stale closure value
+    const currentLocalStream = localStreamRef.current;
+    const currentScreenStream = screenStreamRef2.current;
+
+    if (currentLocalStream) {
+      currentLocalStream.getTracks().forEach((track) => {
+        try {
+          pc.addTrack(track, currentLocalStream);
+        } catch (e) {}
       });
     }
 
+    if (currentScreenStream) {
+      currentScreenStream.getTracks().forEach((track) => {
+        try {
+          pc.addTrack(track, currentScreenStream);
+        } catch (e) {}
+      });
+    }
+
+    // Set up track handler immediately
     pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        setRemoteStreams((prev) => ({
-          ...prev,
-          [pId]: event.streams[0]
-        }));
+      if (event.streams && event.streams.length > 0) {
+        if (!remoteStreamsMapRef.current[pId]) {
+          remoteStreamsMapRef.current[pId] = new Set();
+        }
+        event.streams.forEach(stream => {
+          remoteStreamsMapRef.current[pId].add(stream);
+        });
+        classifyStreams();
+      }
+    };
+
+    // Gather ICE candidates and push safely to Firestore once document exists
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        const candJson = event.candidate.toJSON();
+        sigState.localCandidates.push(candJson);
+        if (sigState.signalingDocExists) {
+          updateDoc(docRef, {
+            [isInitiator ? "candidates_initiator" : "candidates_receiver"]: sigState.localCandidates
+          }).catch((err) => console.warn("[WebRTC] Error updating ICE candidates:", err));
+        }
+      }
+    };
+
+    pc.onnegotiationneeded = async () => {
+      // Only the initiator (lexicographically smaller UID) should create the initial offer.
+      if (!isInitiator) {
+        console.log(`[WebRTC] Responder skipping negotiation offer for peer ${pId}`);
+        return;
+      }
+      try {
+        console.log(`[WebRTC] Negotiation needed for peer ${pId}`);
+        const offer = await pc.createOffer();
+        if (pc.signalingState === 'closed') return;
+        await pc.setLocalDescription(offer);
+        await setDoc(docRef, {
+          offer: { type: "offer", sdp: offer.sdp },
+          offerBy: user.uid,
+          answer: null,
+          answerBy: null,
+          candidates_initiator: sigState.localCandidates,
+          candidates_receiver: []
+        });
+        sigState.signalingDocExists = true;
+      } catch (err) {
+        console.warn("[WebRTC] Error during negotiation offer creation:", err);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        console.warn(`[WebRTC] Connection state ${pc.connectionState} for ${pId}, attempting ICE restart.`);
+        if (isInitiator) {
+          pc.createOffer({ iceRestart: true }).then(async (offer) => {
+            if (pc.signalingState === 'closed') return;
+            await pc.setLocalDescription(offer);
+            await setDoc(docRef, {
+              offer: { type: "offer", sdp: offer.sdp },
+              offerBy: user.uid,
+              answer: null,
+              answerBy: null,
+              candidates_initiator: sigState.localCandidates,
+              candidates_receiver: []
+            });
+            sigState.signalingDocExists = true;
+          }).catch((err) => console.warn("[WebRTC] ICE restart failed:", err));
+        }
       }
     };
 
@@ -187,11 +391,139 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   const [meetingState, setMeetingState] = useState<Meeting>(meeting);
   const [activeQuizzesList, setActiveQuizzesList] = useState<QuizQuestion[]>(meeting.quizzes || []);
 
-  // Accelerated Demo toggle (vital for easy, robust reviewer testing without waiting 10 full minutes!)
-  const [demoMode, setDemoMode] = useState(true);
+  // demoMode state setter
+  const [demoMode, setDemoMode] = useState(false);
 
-  // Next scheduled timestamp logic for presence checks (15 seconds for acceleration vs 10 minutes default)
-  const [nextPopupAtSecond, setNextPopupAtSecond] = useState<number>(15);
+  // Active speaker detection states
+  const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null);
+  const audioAnalysersRef = useRef<Record<string, { analyser: AnalyserNode; source: MediaStreamAudioSourceNode }>>({});
+  const audioContextRef = useRef<AudioContext | null>(null);
+
+  const setupAudioAnalysis = (id: string, stream: MediaStream | null) => {
+    if (!stream || stream.getAudioTracks().length === 0) {
+      cleanupAudioAnalysis(id);
+      return;
+    }
+
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+
+      // If already set up for this id, keep it!
+      const existing = audioAnalysersRef.current[id];
+      if (existing) {
+        return;
+      }
+
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+
+      audioAnalysersRef.current[id] = { analyser, source };
+    } catch (e) {
+      console.warn("Failed to setup audio analysis for", id, e);
+    }
+  };
+
+  const cleanupAudioAnalysis = (id: string) => {
+    const entry = audioAnalysersRef.current[id];
+    if (entry) {
+      try {
+        entry.source.disconnect();
+      } catch (e) {}
+      delete audioAnalysersRef.current[id];
+    }
+  };
+
+  // Synchronize audio analysers when localStream or remoteStreams change
+  useEffect(() => {
+    if (localStream) {
+      setupAudioAnalysis(user.uid, localStream);
+    } else {
+      cleanupAudioAnalysis(user.uid);
+    }
+
+    Object.keys(remoteStreams).forEach((pId) => {
+      const stream = remoteStreams[pId];
+      setupAudioAnalysis(pId, stream);
+    });
+
+    // Cleanup stale analysers
+    Object.keys(audioAnalysersRef.current).forEach((id) => {
+      if (id !== user.uid && !remoteStreams[id]) {
+        cleanupAudioAnalysis(id);
+      }
+    });
+  }, [localStream, remoteStreams, user.uid]);
+
+  // Clean up all analysers on unmount
+  useEffect(() => {
+    return () => {
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      Object.keys(audioAnalysersRef.current).forEach((id) => {
+        cleanupAudioAnalysis(id);
+      });
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
+    };
+  }, []);
+
+  // Poll analyser volume levels to detect active speaker
+  useEffect(() => {
+    const interval = setInterval(() => {
+      let maxVal = -1;
+      let loudestSpeakerId: string | null = null;
+      const threshold = 12; // sensitivity threshold for speaking
+
+      Object.keys(audioAnalysersRef.current).forEach((id) => {
+        const entry = audioAnalysersRef.current[id];
+        if (!entry || !entry.analyser) return;
+
+        let isMuted = false;
+        if (id === user.uid) {
+          isMuted = !micEnabled;
+        } else {
+          const p = activeParticipants.find(part => part.id === id);
+          if (p) {
+            isMuted = !p.micEnabled;
+          }
+        }
+
+        if (isMuted) return;
+
+        const { analyser } = entry;
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(dataArray);
+
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+
+        if (average > threshold && average > maxVal) {
+          maxVal = average;
+          loudestSpeakerId = id;
+        }
+      });
+
+      if (loudestSpeakerId) {
+        setActiveSpeakerId(loudestSpeakerId);
+      }
+    }, 250);
+
+    return () => clearInterval(interval);
+  }, [activeParticipants, micEnabled, user.uid]);
+
+  // Next scheduled timestamp logic for presence checks (default to 10 minutes)
+  const [nextPopupAtSecond, setNextPopupAtSecond] = useState<number>(600);
 
   // Running live feedback array for teacher's scoreboard
   const [liveResponses, setLiveResponses] = useState<MeetingResponse[]>([]);
@@ -214,19 +546,37 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   const [chatOpen, setChatOpen] = useState(false);
   const [messageText, setMessageText] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const prevChatMessagesLengthRef = useRef(0);
+
+  useEffect(() => {
+    if (chatOpen) {
+      setUnreadChatCount(0);
+    } else {
+      const newMsgsCount = chatMessages.length - prevChatMessagesLengthRef.current;
+      if (newMsgsCount > 0) {
+        setUnreadChatCount((c) => c + newMsgsCount);
+      }
+    }
+    prevChatMessagesLengthRef.current = chatMessages.length;
+  }, [chatMessages, chatOpen]);
 
   // Google Meet Layout Settings
   const [meetLayout, setMeetLayout] = useState<'grid' | 'sidebar' | 'spotlight'>('grid');
 
   // Screen Sharing State
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null); // ref to avoid stale closure in onended handler
+  // Keep screenStreamRef2 in sync with screenStream for getOrCreatePC
+  useEffect(() => { screenStreamRef2.current = screenStream; }, [screenStream]);
 
   // Hand Raise State
   const [handRaised, setHandRaised] = useState(false);
   const [handRaisedAt, setHandRaisedAt] = useState<string | null>(null);
 
-  // Minimized Moveable Popup State
+  // Presenter tools floating popup — Picture in Picture API
   const [showMinimizedPopup, setShowMinimizedPopup] = useState(false);
+  const [pipWindow, setPipWindow] = useState<Window | null>(null);
   const [minPopupPos, setMinPopupPos] = useState({ x: 20, y: 120 });
   const [minPopupDragging, setMinPopupDragging] = useState(false);
   const minPopupDragStart = useRef({ x: 0, y: 0 });
@@ -234,32 +584,65 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   // Sidebar Tab state
   const [sidebarTab, setSidebarTab] = useState<'chat' | 'people'>('chat');
 
+  // Participants sidebar state (opened via present-count click or hand-raise queue indicator)
+  const [showParticipantsSidebar, setShowParticipantsSidebar] = useState(false);
+
+
+  const renderParticipantHostControls = (p: ActiveParticipant) => {
+    if (!isHost || p.id === user.uid) return null;
+    return (
+      <div className="absolute top-2 right-2 flex items-center gap-1.5 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleParticipantMic(p.id, p.micEnabled);
+          }}
+          className={`p-1.5 rounded-lg border transition-all cursor-pointer backdrop-blur-md shadow-sm ${
+            p.micEnabled 
+              ? "bg-slate-950/70 border-white/10 text-slate-350 hover:bg-slate-900/90 hover:text-white" 
+              : "bg-red-500/80 border-red-500/20 text-white hover:bg-red-600/90"
+          }`}
+          title={p.micEnabled ? "Mute student" : "Unmute student"}
+        >
+          {p.micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5" />}
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            turnOffParticipantCam(p.id);
+          }}
+          disabled={!p.videoEnabled}
+          className={`p-1.5 rounded-lg border transition-all cursor-pointer disabled:opacity-35 backdrop-blur-md shadow-sm ${
+            p.videoEnabled 
+              ? "bg-slate-950/70 border-white/10 text-slate-350 hover:bg-slate-900/90 hover:text-white" 
+              : "bg-red-500/80 border-red-500/20 text-white"
+          }`}
+          title="Turn off student camera"
+        >
+          {p.videoEnabled ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5" />}
+        </button>
+      </div>
+    );
+  };
+
+  // Leave modals state
+  const [showLeaveModal, setShowLeaveModal] = useState(false);
+  const [showFinishConfirmModal, setShowFinishConfirmModal] = useState(false);
+
   // Teacher Control Room Draggable Controls
   const [tcDragOffset, setTcDragOffset] = useState({ x: 20, y: 70 });
   const [tcIsDragging, setTcIsDragging] = useState(false);
   const tcDragStartRef = useRef({ x: 0, y: 0 });
   const tcElementStartRef = useRef({ x: 0, y: 0 });
   const [tcMinimized, setTcMinimized] = useState(false);
-  const [rawParticipants, setRawParticipants] = useState<ActiveParticipant[]>([]);
-  const [presenceTicker, setPresenceTicker] = useState(0);
 
-  useEffect(() => {
-    const t = setInterval(() => {
-      setPresenceTicker((p) => p + 1);
-    }, 4000);
-    return () => clearInterval(t);
-  }, []);
-
-  const activeParticipants = useMemo(() => {
-    const now = Date.now();
-    return rawParticipants.filter((p) => {
-      if (!p.lastActive) return true;
-      const diff = now - new Date(p.lastActive).getTime();
-      return diff <= 12000; // 12 seconds threshold (stale check for inactive participants)
-    });
-  }, [rawParticipants, presenceTicker]);
-
-  const setActiveParticipants = setRawParticipants;
+  const spotlightParticipant = useMemo(() => {
+    if (activeSpeakerId && activeSpeakerId !== user.uid) {
+      const p = activeParticipants.find(part => part.id === activeSpeakerId);
+      if (p) return p;
+    }
+    return activeParticipants[0] || null;
+  }, [activeSpeakerId, activeParticipants, user.uid]);
 
   const allHandRaisers = [
     ...(handRaised ? [{ id: user.uid, name: `${user.name} (You)`, role: user.role, handRaisedAt }] : []),
@@ -275,6 +658,12 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   // Simulation timeline & status
   const [callDuration, setCallDuration] = useState(0);
   const [recordingActive, setRecordingActive] = useState(true);
+
+  // Browser-based MediaRecorder state (host only)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const [uploadingRecording, setUploadingRecording] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
 
   // Session Settings & Control Room states
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -393,34 +782,82 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     };
   }, [tcIsDragging]);
 
-  // Trigger minimized controls popup when screensharing user leaves/defocuses the browser tab/window
+  // Document Picture-in-Picture logic
   useEffect(() => {
-    const handleBlur = () => {
-      if (screenStream) {
-        setShowMinimizedPopup(true);
+    if (!showMinimizedPopup) {
+      if (pipWindow) {
+        pipWindow.close();
+        setPipWindow(null);
+      }
+      return;
+    }
+
+    let isSubscribed = true;
+
+    const openPiP = async () => {
+      if ('documentPictureInPicture' in window) {
+        try {
+          // @ts-ignore
+          const pip = await window.documentPictureInPicture.requestWindow({
+            width: 360,
+            height: 480,
+          });
+
+          if (!isSubscribed) {
+            pip.close();
+            return;
+          }
+
+          // Copy styles for Tailwind
+          [...document.styleSheets].forEach((styleSheet) => {
+            try {
+              const cssRules = [...styleSheet.cssRules].map((rule) => rule.cssText).join('');
+              const style = document.createElement('style');
+              style.textContent = cssRules;
+              pip.document.head.appendChild(style);
+            } catch (e) {
+              const link = document.createElement('link');
+              link.rel = 'stylesheet';
+              link.type = styleSheet.type;
+              link.media = styleSheet.media.mediaText || '';
+              link.href = styleSheet.href || '';
+              pip.document.head.appendChild(link);
+            }
+          });
+
+          // Sync fonts if possible
+          const fontLink = document.createElement('link');
+          fontLink.rel = 'stylesheet';
+          fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap';
+          pip.document.head.appendChild(fontLink);
+
+          pip.document.body.className = "bg-slate-950 font-sans antialiased text-slate-200 overflow-hidden";
+
+          pip.addEventListener('pagehide', () => {
+            setShowMinimizedPopup(false);
+            setPipWindow(null);
+          });
+
+          setPipWindow(pip);
+        } catch (err) {
+          console.warn("PiP failed to open", err);
+          // Browser blocking popup without user gesture
+        }
       }
     };
 
-    const handleFocus = () => {
-      // Keep open so they can interact or dismiss manually
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.hidden && screenStream) {
-        setShowMinimizedPopup(true);
-      }
-    };
-
-    window.addEventListener("blur", handleBlur);
-    window.addEventListener("focus", handleFocus);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
+    if (showMinimizedPopup && !pipWindow) {
+      openPiP();
+    }
+    
     return () => {
-      window.removeEventListener("blur", handleBlur);
-      window.removeEventListener("focus", handleFocus);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      isSubscribed = false;
+      if (pipWindow) {
+        pipWindow.close();
+        setPipWindow(null);
+      }
     };
-  }, [screenStream]);
+  }, [showMinimizedPopup]);
 
   // Loading default meeting quizzes if empty
   useEffect(() => {
@@ -448,16 +885,24 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       });
       
       setScreenStream(stream);
+      screenStreamRef.current = stream;
 
-      // Update Firestore meeting doc
+      // Update Firestore meeting doc — also update presence so others see screenStreamId
       await updateDoc(doc(db, "meetings", meeting.id), {
         screenShareBy: user.uid,
         screenShareByName: user.name
       });
 
+      // Presence update with screenStreamId for WebRTC stream classification
+      const userPresenceRef = doc(db, `meetings/${meeting.id}/presence`, user.uid);
+      await updateDoc(userPresenceRef, {
+        screenStreamId: stream.id,
+      }).catch(() => {});
+
       // Handle when the browser screen share "Stop sharing" button is clicked
-      stream.getVideoTracks()[0].onended = async () => {
-        await stopScreenShare(stream);
+      // Use ref to avoid stale closure
+      stream.getVideoTracks()[0].onended = () => {
+        stopScreenShare();
       };
 
     } catch (err) {
@@ -466,18 +911,30 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     }
   };
 
-  const stopScreenShare = async (activeStream?: MediaStream) => {
-    const streamToStop = activeStream || screenStream;
+  const stopScreenShare = async () => {
+    const streamToStop = screenStreamRef.current;
     if (streamToStop) {
       streamToStop.getTracks().forEach((track) => track.stop());
     }
+    screenStreamRef.current = null;
     setScreenStream(null);
+    setShowMinimizedPopup(false);
+
+    // Clear screenStreamId from presence so others know screen share ended
+    try {
+      const userPresenceRef = doc(db, `meetings/${meeting.id}/presence`, user.uid);
+      await updateDoc(userPresenceRef, { screenStreamId: null }).catch(() => {});
+    } catch (_) {}
 
     // Update Firestore to clear screen sharing
-    await updateDoc(doc(db, "meetings", meeting.id), {
-      screenShareBy: null,
-      screenShareByName: null
-    });
+    try {
+      await updateDoc(doc(db, "meetings", meeting.id), {
+        screenShareBy: null,
+        screenShareByName: null
+      });
+    } catch (err) {
+      console.warn("Failed to clear screen share state in Firestore:", err);
+    }
   };
 
   const toggleHand = () => {
@@ -537,11 +994,12 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   };
 
   // Automatically detect leaving meeting window (tab switch, minimize, or focus loss) while screen sharing
+  // Only show the popup if it's already been manually opened (not auto-open on every blur)
   useEffect(() => {
     const handleVisibilityOrBlur = () => {
-      // If we are sharing screen and the document is hidden or blurred, open the minimized controls
-      if (screenStream && (document.visibilityState === 'hidden' || !document.hasFocus())) {
-        setShowMinimizedPopup(true);
+      // Only auto-show the popup if screen is being shared AND popup was already shown once
+      if (screenStreamRef.current && showMinimizedPopup && (document.visibilityState === 'hidden' || !document.hasFocus())) {
+        // Already showing — no action needed
       }
     };
 
@@ -552,16 +1010,17 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       document.removeEventListener("visibilitychange", handleVisibilityOrBlur);
       window.removeEventListener("blur", handleVisibilityOrBlur);
     };
-  }, [screenStream]);
+  }, [showMinimizedPopup]);
 
   // Clean up screen sharing on unmount
   useEffect(() => {
     return () => {
-      if (screenStream) {
-        screenStream.getTracks().forEach((track) => track.stop());
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((track) => track.stop());
+        screenStreamRef.current = null;
       }
     };
-  }, [screenStream]);
+  }, []);
 
   // Dragging logic for floating Minimized controls popup
   const handleMinPopupMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -616,95 +1075,243 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     };
   }, [minPopupDragging]);
 
-  // WebRTC camera hookup
+  // Initialize local stream once on mount
   useEffect(() => {
-    if (videoEnabled) {
-      navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-        .then((stream) => {
-          setLocalStream(stream);
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
+    let active = true;
+
+    const initStream = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        if (!active) {
+          stream.getTracks().forEach(t => t.stop());
+          return;
+        }
+        localStreamRef.current = stream;
+        setLocalStream(stream);
+      } catch (err) {
+        console.warn("Failed to get both video and audio, trying audio only...", err);
+        if (active) {
+          setVideoEnabled(false);
+        }
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+          if (!active) {
+            stream.getTracks().forEach(t => t.stop());
+            return;
           }
-        })
-        .catch((err) => {
-          console.warn("Camera capture was blocked or unavailable:", err);
-          setLocalStream(null);
-        });
-    } else {
-      if (localStream) {
-        localStream.getTracks().forEach((track) => track.stop());
+          localStreamRef.current = stream;
+          setLocalStream(stream);
+        } catch (err2) {
+          console.error("Failed to get audio only. Creating empty MediaStream for signaling...", err2);
+          if (active) {
+            setMicEnabled(false);
+            const empty = new MediaStream();
+            localStreamRef.current = empty;
+            setLocalStream(empty);
+          }
+        }
       }
-      setLocalStream(null);
+    };
+
+    initStream();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Auto-start MediaRecorder for host when localStream is ready
+  useEffect(() => {
+    if (!isHost || !localStream || localStream.getTracks().length === 0) return;
+    if (mediaRecorderRef.current) return; // already recording
+
+    try {
+      const combinedStream = new MediaStream([
+        ...localStream.getVideoTracks(),
+        ...localStream.getAudioTracks(),
+      ]);
+
+      const supportedMime =
+        MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+          ? "video/webm;codecs=vp9,opus"
+          : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
+          ? "video/webm;codecs=vp8,opus"
+          : "video/webm";
+
+      const recorder = new MediaRecorder(combinedStream, { mimeType: supportedMime });
+      recordingChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          recordingChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.start(5000); // collect data every 5 seconds
+      mediaRecorderRef.current = recorder;
+      console.log("[Recording] MediaRecorder started for host, mimeType:", supportedMime);
+    } catch (err) {
+      console.warn("[Recording] Failed to start MediaRecorder:", err);
     }
 
+    return () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+    };
+  }, [isHost, localStream]);
+
+  // Handle audio track mute/unmute — only mute, never stop the audio track
+
+  useEffect(() => {
+    if (localStream) {
+      localStream.getAudioTracks().forEach((track) => {
+        track.enabled = micEnabled;
+      });
+    }
+  }, [localStream, micEnabled]);
+
+  // Handle VIDEO on/off — toggle track enablement rather than stopping/re-acquiring to prevent browser permission blocks
+  useEffect(() => {
+    if (localStream) {
+      localStream.getVideoTracks().forEach((track) => {
+        track.enabled = videoEnabled;
+      });
+    }
+  }, [videoEnabled, localStream]);
+
+  // Clean up all localStream tracks on unmount
+  useEffect(() => {
     return () => {
       if (localStream) {
         localStream.getTracks().forEach((track) => track.stop());
       }
     };
-  }, [videoEnabled]);
+  }, [localStream]);
 
-  // Re-attach localStream when layout or localStream shifts
-  useEffect(() => {
-    if (localStream && videoRef.current) {
-      videoRef.current.srcObject = localStream;
-    }
-  }, [localStream, meetLayout]);
-
-  // WebRTC dynamic active peer cleanup
+  // WebRTC dynamic active peer cleanup when participants leave
   useEffect(() => {
     const activeIds = new Set(activeParticipants.map(p => p.id));
+    let changed = false;
     Object.keys(pcsRef.current).forEach((pId) => {
       if (!activeIds.has(pId)) {
-        try {
-          pcsRef.current[pId].close();
-        } catch (e) {}
+        try { pcsRef.current[pId].close(); } catch (e) {}
         delete pcsRef.current[pId];
-        setRemoteStreams((prev) => {
-          const next = { ...prev };
-          delete next[pId];
-          return next;
-        });
+        delete remoteStreamsMapRef.current[pId];
+        // Remove from initialized set so it gets a fresh signaling doc on reconnect
+        initializedPeersRef.current.delete(pId);
+        // Clean up the Firestore webrtc signaling doc for this channel
+        const channelId = user.uid < pId ? `${user.uid}_${pId}` : `${pId}_${user.uid}`;
+        deleteDoc(doc(db, `meetings/${meeting.id}/webrtc`, channelId)).catch(() => {});
+        changed = true;
       }
     });
+    if (changed) classifyStreams();
   }, [activeParticipants]);
 
-  // Real WebRTC peer correlation and multi-session mesh over Firestore signalling
+  // Keep local/screen tracks in sync for all active peer connections (add/replace/remove as needed)
+  useEffect(() => {
+    activeParticipants.forEach((p) => {
+      const pc = pcsRef.current[p.id];
+      if (!pc || pc.signalingState === 'closed') return;
+
+      const currentSenders = pc.getSenders();
+      const allActiveTracks: MediaStreamTrack[] = [
+        ...(localStreamRef.current ? localStreamRef.current.getTracks() : []),
+        ...(screenStreamRef2.current ? screenStreamRef2.current.getTracks() : [])
+      ];
+
+      // Add any tracks that are missing from senders
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => {
+          const alreadySending = currentSenders.some(s => s.track === track);
+          if (!alreadySending) {
+            try { pc.addTrack(track, localStreamRef.current!); } catch (e) {}
+          }
+        });
+      }
+      if (screenStreamRef2.current) {
+        screenStreamRef2.current.getTracks().forEach((track) => {
+          const alreadySending = currentSenders.some(s => s.track === track);
+          if (!alreadySending) {
+            try { pc.addTrack(track, screenStreamRef2.current!); } catch (e) {}
+          }
+        });
+      }
+
+      // Remove senders whose tracks are no longer in any active stream
+      currentSenders.forEach((sender) => {
+        if (sender.track && !allActiveTracks.includes(sender.track)) {
+          try { pc.removeTrack(sender); } catch (e) {}
+        }
+      });
+    });
+  }, [activeParticipants, localStream, screenStream]);
+
+  // Extract participant IDs to avoid re-running signaling when other properties (like lastActive/heartbeat) change
+  const participantIds = useMemo(() => {
+    return activeParticipants.map(p => p.id).sort().join(",");
+  }, [activeParticipants]);
+
+  // Real WebRTC peer mesh over Firestore signaling
+  // Only runs when the SET of participant IDs changes or localStream becomes available.
+  // Initiator (lexicographically smaller UID) creates the offer; responder answers.
+  // This eliminates offer-glare (both sides creating offers simultaneously).
   useEffect(() => {
     if (!localStream) return;
 
     const unsubscribes: (() => void)[] = [];
 
     activeParticipants.forEach((p) => {
+      if (p.id === user.uid) return; // skip self
+
+      // Consistent channel ID regardless of who joined first
       const channelId = user.uid < p.id ? `${user.uid}_${p.id}` : `${p.id}_${user.uid}`;
+      // The peer with the lexicographically smaller UID is always the initiator (creates the offer)
       const isInitiator = user.uid < p.id;
+      const isPolite = user.uid > p.id;
       const docRef = doc(db, `meetings/${meeting.id}/webrtc`, channelId);
 
       const pc = getOrCreatePC(p.id);
+      if (!pc || pc.signalingState === 'closed') return;
 
-      const localCandidates: any[] = [];
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          localCandidates.push(event.candidate.toJSON());
-          updateDoc(docRef, {
-            [isInitiator ? "candidates_initiator" : "candidates_receiver"]: localCandidates
-          }).catch(() => {});
-        }
+      const sigState = pcsSignalingRef.current[p.id] || {
+        localCandidates: [],
+        signalingDocExists: false,
+        addedRemoteCandidates: new Set()
       };
 
+      // Detect whether this is the first time we're setting up signaling for this peer.
+      const isNewPeer = !initializedPeersRef.current.has(p.id);
+      if (isNewPeer && isInitiator) {
+        // Wipe the stale doc; the onSnapshot !exists branch will then create a fresh offer
+        deleteDoc(docRef).catch(() => {});
+        sigState.signalingDocExists = false;
+        sigState.localCandidates = [];
+      }
+      initializedPeersRef.current.add(p.id);
+
       const unsub = onSnapshot(docRef, async (snapshot) => {
+        if (pc.signalingState === 'closed') return;
+
         if (!snapshot.exists()) {
-          if (isInitiator) {
-            try {
-              const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
-              await setDoc(docRef, {
-                offer: { type: "offer", sdp: offer.sdp },
-                candidates_initiator: []
-              });
-            } catch (err) {
-              console.warn("Error creating offer:", err);
-            }
+          sigState.signalingDocExists = false;
+          if (!isInitiator) return; // Responder waits for the offer doc
+          try {
+            if (pc.signalingState !== 'stable') return;
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            await setDoc(docRef, {
+              offer: { type: "offer", sdp: offer.sdp },
+              offerBy: user.uid,
+              answer: null,
+              answerBy: null,
+              candidates_initiator: sigState.localCandidates,
+              candidates_receiver: []
+            });
+            sigState.signalingDocExists = true;
+          } catch (err) {
+            console.warn("[WebRTC] Error creating initial offer:", err);
           }
           return;
         }
@@ -712,42 +1319,64 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
         const data = snapshot.data();
         if (!data) return;
 
-        if (isInitiator) {
-          if (data.answer && pc.signalingState === "have-local-offer") {
+        sigState.signalingDocExists = true;
+
+        // Push any queued local candidates since the document exists now
+        if (sigState.localCandidates.length > 0) {
+          updateDoc(docRef, {
+            [isInitiator ? "candidates_initiator" : "candidates_receiver"]: sigState.localCandidates
+          }).catch(() => {});
+        }
+
+        // ── Responder receives offer → creates answer ──
+        if (data.offer && data.offerBy !== user.uid && !data.answer) {
+          if (pc.signalingState === "stable" || pc.signalingState === "have-local-offer") {
             try {
-              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-            } catch (err) {
-              console.warn("Error setting remote answer:", err);
-            }
-          }
-          if (data.candidates_receiver && data.candidates_receiver.length > 0) {
-            data.candidates_receiver.forEach((cand: any) => {
-              try {
-                pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-              } catch (e) {}
-            });
-          }
-        } else {
-          if (data.offer && pc.signalingState === "stable") {
-            try {
+              if (pc.signalingState === "have-local-offer") {
+                // Roll back our offer (impolite peer check — only responder rolls back)
+                if (isPolite) {
+                  console.log(`[WebRTC] Polite rollback for peer ${p.id}`);
+                  await pc.setLocalDescription({ type: "rollback" });
+                } else {
+                  console.log(`[WebRTC] Impolite glare ignore for peer ${p.id}`);
+                  return;
+                }
+              }
               await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
               await updateDoc(docRef, {
                 answer: { type: "answer", sdp: answer.sdp },
-                candidates_receiver: []
+                answerBy: user.uid,
+                candidates_receiver: sigState.localCandidates
               });
             } catch (err) {
-              console.warn("Error setting remote offer:", err);
+              console.warn("[WebRTC] Error answering offer:", err);
             }
           }
-          if (data.candidates_initiator && data.candidates_initiator.length > 0) {
-            data.candidates_initiator.forEach((cand: any) => {
-              try {
-                pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-              } catch (e) {}
-            });
+        }
+
+        // ── Peer receives answer for their offer ──
+        if (data.answer && data.answerBy !== user.uid && data.offerBy === user.uid) {
+          if (pc.signalingState === "have-local-offer") {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+            } catch (err) {
+              console.warn("[WebRTC] Error setting remote answer:", err);
+            }
           }
+        }
+
+        // ── ICE Candidates sync (apply remote candidates we haven't seen yet) ──
+        const remoteCandidates = isInitiator ? data.candidates_receiver : data.candidates_initiator;
+        if (remoteCandidates && remoteCandidates.length > 0 && pc.remoteDescription) {
+          remoteCandidates.forEach((cand: any) => {
+            const candStr = JSON.stringify(cand);
+            if (!sigState.addedRemoteCandidates.has(candStr)) {
+              sigState.addedRemoteCandidates.add(candStr);
+              pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+          });
         }
       });
 
@@ -757,74 +1386,63 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     return () => {
       unsubscribes.forEach((unsub) => unsub());
     };
-  }, [activeParticipants, localStream]);
+  }, [participantIds, localStream]);
 
   // General Call clock duration
   useEffect(() => {
     const clock = setInterval(() => {
-      setCallDuration((prev) => prev + 1);
+      const startRef = meetingState?.startedAt || meetingState?.createdAt || new Date().toISOString();
+      const diffSecs = Math.floor((Date.now() - new Date(startRef).getTime()) / 1000);
+      setCallDuration(Math.max(0, diffSecs));
     }, 1000);
     return () => clearInterval(clock);
-  }, []);
+  }, [meetingState?.startedAt, meetingState?.createdAt]);
 
-  // Synchronize presence in this meeting in real-time
+  // ── Presence: stable subscription (runs once, never torn down mid-meeting) ──
+  // This effect ONLY sets up the Firestore listener and heartbeat.
+  // It does NOT depend on mic/video/screen state to avoid re-subscribing on every toggle.
   useEffect(() => {
     const userPresenceRef = doc(db, `meetings/${meeting.id}/presence`, user.uid);
-    
-    const updatePresence = async () => {
-      try {
-        await setDoc(userPresenceRef, {
-          id: user.uid,
-          name: user.name,
-          role: user.role,
-          videoEnabled: videoEnabled,
-          micEnabled: micEnabled,
-          handRaised: handRaised,
-          handRaisedAt: handRaisedAt,
-          joinedAt: new Date().toISOString(),
-          lastActive: new Date().toISOString()
-        });
-      } catch (e) {
-        console.warn("Failed initial presence update:", e);
-      }
-    };
+    const joinedTime = new Date().toISOString();
 
-    updatePresence();
+    // Write initial presence doc so others can see us immediately
+    setDoc(userPresenceRef, {
+      id: user.uid,
+      name: user.name,
+      role: user.role,
+      videoEnabled: true,
+      micEnabled: true,
+      cameraStreamId: null,
+      screenStreamId: null,
+      handRaised: false,
+      handRaisedAt: null,
+      joinedAt: joinedTime,
+      lastActive: new Date().toISOString()
+    }).catch((e) => console.warn("Initial presence write failed:", e));
 
-    // Heartbeat updates lastActive every 5000ms
+    // Heartbeat: only updates lastActive — never overwrites media fields
     const heartbeatInterval = setInterval(async () => {
       try {
-        await updateDoc(userPresenceRef, {
-          lastActive: new Date().toISOString()
-        });
+        await updateDoc(userPresenceRef, { lastActive: new Date().toISOString() });
       } catch (err) {
-        // Fallback to setDoc in case document got removed or needs re-initialization
-        try {
-          await setDoc(userPresenceRef, {
-            id: user.uid,
-            name: user.name,
-            role: user.role,
-            videoEnabled: videoEnabled,
-            micEnabled: micEnabled,
-            handRaised: handRaised,
-            handRaisedAt: handRaisedAt,
-            joinedAt: new Date().toISOString(),
-            lastActive: new Date().toISOString()
-          });
-        } catch (e) {
-          console.warn("Heartbeat recovery failed:", e);
-        }
+        // Doc may not exist yet (race), retry full write
+        setDoc(userPresenceRef, {
+          id: user.uid, name: user.name, role: user.role,
+          videoEnabled: true, micEnabled: true,
+          cameraStreamId: null, screenStreamId: null,
+          handRaised: false, handRaisedAt: null,
+          joinedAt: joinedTime, lastActive: new Date().toISOString()
+        }, { merge: true }).catch(() => {});
       }
     }, 5000);
 
     const cleanPresenceOnUnload = () => {
-      // Clean up Firestore doc as fast as possible on window close
-      deleteDoc(userPresenceRef).catch((e) => console.warn("Failed delete presence on tab close:", e));
+      deleteDoc(userPresenceRef).catch(() => {});
     };
-
     window.addEventListener("beforeunload", cleanPresenceOnUnload);
     window.addEventListener("unload", cleanPresenceOnUnload);
 
+    // Listen to ALL participants' presence docs
     const presenceCollection = collection(db, `meetings/${meeting.id}/presence`);
     const unsubscribe = onSnapshot(presenceCollection, (snapshot) => {
       const list: ActiveParticipant[] = [];
@@ -837,6 +1455,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
             role: data.role || "student",
             videoEnabled: !!data.videoEnabled,
             micEnabled: !!data.micEnabled,
+            cameraStreamId: data.cameraStreamId || null,
+            screenStreamId: data.screenStreamId || null,
             handRaised: !!data.handRaised,
             handRaisedAt: data.handRaisedAt || null,
             joinedAt: data.joinedAt || new Date().toISOString(),
@@ -852,11 +1472,44 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       window.removeEventListener("beforeunload", cleanPresenceOnUnload);
       window.removeEventListener("unload", cleanPresenceOnUnload);
       unsubscribe();
-      deleteDoc(userPresenceRef).catch((e) => console.warn("Failed to delete presence:", e));
+      deleteDoc(userPresenceRef).catch(() => {});
     };
-  }, [meeting.id, user, videoEnabled, micEnabled, handRaised, handRaisedAt]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meeting.id, user.uid]); // ← Stable deps only! Do NOT add mic/video/screen here.
+
+  // ── Presence: patch media state fields on every toggle ──
+  // This runs separately from the subscription so we never tear down the listener.
+  useEffect(() => {
+    const userPresenceRef = doc(db, `meetings/${meeting.id}/presence`, user.uid);
+    updateDoc(userPresenceRef, {
+      videoEnabled,
+      micEnabled,
+      cameraStreamId: localStream?.id || null,
+      screenStreamId: screenStream?.id || null,
+    }).catch(() => {});
+  }, [videoEnabled, micEnabled, localStream, screenStream, meeting.id, user.uid]);
+
+  // ── Presence: patch hand-raise state on every toggle ──
+  useEffect(() => {
+    const userPresenceRef = doc(db, `meetings/${meeting.id}/presence`, user.uid);
+    updateDoc(userPresenceRef, {
+      handRaised,
+      handRaisedAt,
+    }).catch(() => {});
+  }, [handRaised, handRaisedAt, meeting.id, user.uid]);
+
+  // Keep active participants ref in sync and reclassify streams when activeParticipants change
+  useEffect(() => {
+    activeParticipantsRef.current = activeParticipants;
+    classifyStreams();
+  }, [activeParticipants]);
 
   // Listen to user's own presence document for remote teacher commands (mute / camera off)
+  const micEnabledRef = useRef(micEnabled);
+  const videoEnabledRef = useRef(videoEnabled);
+  useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
+  useEffect(() => { videoEnabledRef.current = videoEnabled; }, [videoEnabled]);
+
   useEffect(() => {
     if (isHost) return; // Only students can be remotely controlled
     const userPresenceRef = doc(db, `meetings/${meeting.id}/presence`, user.uid);
@@ -864,17 +1517,17 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       if (docSnap.exists()) {
         const data = docSnap.data();
         if (data) {
-          // If the teacher muted us remotely
-          if (data.micEnabled === false && micEnabled) {
+          // If the teacher muted us remotely — use refs to avoid stale closure loops
+          if (data.micEnabled === false && micEnabledRef.current) {
             setMicEnabled(false);
-          } else if (data.micEnabled === true && !micEnabled) {
+          } else if (data.micEnabled === true && !micEnabledRef.current) {
             setMicEnabled(true);
           }
           
           // If the teacher turned off our camera remotely
-          if (data.videoEnabled === false && videoEnabled) {
+          if (data.videoEnabled === false && videoEnabledRef.current) {
             setVideoEnabled(false);
-          } else if (data.videoEnabled === true && !videoEnabled) {
+          } else if (data.videoEnabled === true && !videoEnabledRef.current) {
             setVideoEnabled(true);
           }
         }
@@ -883,16 +1536,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       console.warn("Error listening to user presence:", error);
     });
     return () => unsubscribe();
-  }, [meeting.id, user.uid, micEnabled, videoEnabled, isHost]);
-
-  // Handle physical muting of audio tracks on localStream
-  useEffect(() => {
-    if (localStream) {
-      localStream.getAudioTracks().forEach((track) => {
-        track.enabled = micEnabled;
-      });
-    }
-  }, [localStream, micEnabled]);
+  }, [meeting.id, user.uid, isHost]); // NO micEnabled/videoEnabled in deps — uses refs to avoid infinite loops
 
   // Synchronize chat messages in real-time
   useEffect(() => {
@@ -1094,8 +1738,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     if (activeQuizzesList.length === 0) return;
 
     const intervalVal = meetingState?.quizTriggerInterval || 5;
-    // Accelerated in demoMode (e.g. 35s per interval step) vs standard (intervalVal minutes converted to seconds)
-    const intervalSeconds = demoMode ? 35 : (intervalVal * 60);
+    const intervalSeconds = intervalVal * 60;
 
     const checkQuizTriggers = () => {
       // Offset by 1 so the first quiz triggers after 1 full interval, not instantly at 0
@@ -1110,7 +1753,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     };
 
     checkQuizTriggers();
-  }, [callDuration, activeQuizzesList, isHost, demoMode, meetingState?.quizTriggerInterval, meetingState?.liveQuizDisabled, currentQuizIndex]);
+  }, [callDuration, activeQuizzesList, isHost, meetingState?.quizTriggerInterval, meetingState?.liveQuizDisabled, currentQuizIndex]);
 
   // AUTO GENERATE DYNAMIC QUIZZES FROM LIVE DISCUSSIONS TRANSCRIPT & OUTLINES (Every 10-15 minutes or 50s in Demo mode)
   useEffect(() => {
@@ -1125,7 +1768,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       setLastLiveQuizGeneratedAt(callDuration);
       triggerLiveDiscussionQuizGeneration();
     }
-  }, [callDuration, isHost, demoMode, meetingState?.liveQuizGenerationEnabled, meetingState?.liveQuizDisabled, lastLiveQuizGeneratedAt]);
+  }, [callDuration, isHost, meetingState?.liveQuizGenerationEnabled, meetingState?.liveQuizDisabled, lastLiveQuizGeneratedAt, meetingState?.liveQuizGenerationInterval]);
 
   const triggerLiveDiscussionQuizGeneration = async () => {
     if (generatingLiveQuiz) return;
@@ -1136,30 +1779,48 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           title: meetingState.title,
-          chatMessages: chatMessages.slice(-15), // send last 15 messages for transcript extraction
+          chatMessages: chatMessages.slice(-15),
           existingDiscussion: meetingState.discussionMaterial || ""
         }),
       });
 
       const data = await response.json();
-      if (data.quiz) {
-        // Append this new quiz question to firestore quizzes array
-        const updatedQuizzes = [...(meetingState.quizzes || []), data.quiz];
+      // Accept quiz from API response (server already provides fallback quiz on error)
+      const quizToAdd = data.quiz || DEFAULT_MEETING_QUIZZES[Math.floor(Math.random() * DEFAULT_MEETING_QUIZZES.length)];
+
+      if (quizToAdd) {
+        const updatedQuizzes = [...(meetingState.quizzes || []), quizToAdd];
         await updateDoc(doc(db, "meetings", meeting.id), {
           quizzes: updatedQuizzes
         });
 
-        // Add automated system notification in chat
         await addDoc(collection(db, `meetings/${meeting.id}/chat`), {
           senderName: "AI Companion",
           senderRole: "assistant",
-          message: `📢 [Live Recall Checkpoint Generated] A brand-new discussion question has been distributed! Checkpoint #${updatedQuizzes.length}: "${data.quiz.question}" is now live.`,
+          message: `📢 [Live Recall Checkpoint Generated] A brand-new discussion question has been distributed! Checkpoint #${updatedQuizzes.length}: "${quizToAdd.question}" is now live.`,
           timestamp: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }),
           createdAt: new Date().toISOString()
         });
       }
     } catch (error) {
-      console.error("Failed to generate live discussion quiz:", error);
+      console.error("Live discussion quiz generation failed, using dummy fallback:", error);
+      // Fallback: use a default quiz directly without crashing
+      try {
+        const fallbackQuiz = DEFAULT_MEETING_QUIZZES[Math.floor(Math.random() * DEFAULT_MEETING_QUIZZES.length)];
+        const updatedQuizzes = [...(meetingState.quizzes || []), fallbackQuiz];
+        await updateDoc(doc(db, "meetings", meeting.id), {
+          quizzes: updatedQuizzes
+        });
+        await addDoc(collection(db, `meetings/${meeting.id}/chat`), {
+          senderName: "AI Companion",
+          senderRole: "assistant",
+          message: `📢 [Checkpoint Generated] Checkpoint #${updatedQuizzes.length}: "${fallbackQuiz.question}" is now live.`,
+          timestamp: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }),
+          createdAt: new Date().toISOString()
+        });
+      } catch (fallbackErr) {
+        console.error("Fallback quiz push also failed:", fallbackErr);
+      }
     } finally {
       setGeneratingLiveQuiz(false);
     }
@@ -1222,36 +1883,84 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       return;
     }
 
+    // Stop the MediaRecorder and collect any remaining data
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      setUploadingRecording(true);
+      setUploadProgress("Finalizing class recording...");
+
+      await new Promise<void>((resolve) => {
+        recorder.onstop = () => resolve();
+        recorder.stop();
+      });
+    }
+
     try {
-      // Find a highly relevant simulated recording video URL based on class topic
-      const combined = `${meeting.title || ""} ${meeting.description || ""}`.toLowerCase();
-      let simulatedVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4";
-      
-      if (combined.includes("cell") || combined.includes("biology") || combined.includes("mitochondria") || combined.includes("photosynthesis") || combined.includes("chloroplast") || combined.includes("organelle") || combined.includes("science")) {
-        simulatedVideoUrl = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
-      } else if (combined.includes("code") || combined.includes("program") || combined.includes("javascript") || combined.includes("python") || combined.includes("software") || combined.includes("computer")) {
-        simulatedVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4";
-      } else if (combined.includes("math") || combined.includes("calcul") || combined.includes("algebra") || combined.includes("number") || combined.includes("equation") || combined.includes("geometry")) {
-        simulatedVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
-      } else if (combined.includes("history") || combined.includes("century") || combined.includes("empire") || combined.includes("revolution") || combined.includes("renaissance")) {
-        simulatedVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4";
+      let finalVideoUrl = meeting.recordedVideoUrl || "";
+
+      // Upload captured recording blob if we have data
+      if (recordingChunksRef.current.length > 0) {
+        setUploadProgress("Uploading class recording to server...");
+
+        const mimeType = mediaRecorderRef.current?.mimeType || "video/webm";
+        const blob = new Blob(recordingChunksRef.current, { type: mimeType });
+
+        try {
+          const uploadRes = await fetch(`/api/upload-recording?meetingId=${meeting.id}`, {
+            method: "POST",
+            headers: { "Content-Type": "video/webm" },
+            body: blob,
+          });
+
+          const uploadData = await uploadRes.json();
+          if (uploadData.success && uploadData.url) {
+            finalVideoUrl = uploadData.url;
+            console.log("[Recording] Upload successful:", finalVideoUrl);
+          }
+        } catch (uploadErr) {
+          console.warn("[Recording] Upload failed, using fallback sample video:", uploadErr);
+        }
       }
+
+      // Fallback: if no recording was captured, use a topic-appropriate sample video
+      if (!finalVideoUrl) {
+        const combined = `${meeting.title || ""} ${meeting.description || ""}`.toLowerCase();
+        if (combined.includes("cell") || combined.includes("biology") || combined.includes("science") || combined.includes("mitochondria") || combined.includes("photosynthesis")) {
+          finalVideoUrl = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+        } else if (combined.includes("code") || combined.includes("program") || combined.includes("javascript") || combined.includes("python") || combined.includes("software")) {
+          finalVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4";
+        } else if (combined.includes("math") || combined.includes("calcul") || combined.includes("algebra") || combined.includes("equation")) {
+          finalVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+        } else if (combined.includes("history") || combined.includes("century") || combined.includes("empire") || combined.includes("revolution")) {
+          finalVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4";
+        } else {
+          finalVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4";
+        }
+      }
+
+      setUploadProgress("Saving session data...");
 
       // Update meeting status in Firestore
       const meetDocRef = doc(db, "meetings", meeting.id);
       await updateDoc(meetDocRef, {
         status: "ended",
         endedAt: new Date().toISOString(),
-        recordedVideoUrl: meeting.recordedVideoUrl || simulatedVideoUrl
+        recordedVideoUrl: finalVideoUrl,
       });
+
+      setUploadingRecording(false);
+      setUploadProgress(null);
 
       // Navigate to dashboard
       onLeave();
     } catch (err) {
       console.error("Failed closing session:", err);
+      setUploadingRecording(false);
+      setUploadProgress(null);
       onLeave();
     }
   };
+
 
   const getGridLayoutClass = (totalCount: number) => {
     if (totalCount === 1) {
@@ -1274,7 +1983,23 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
   return (
     <div className="fixed inset-0 bg-slate-950 text-slate-200 flex flex-col z-50 select-none">
-      
+
+      {/* Upload progress overlay — shown while recording is being saved */}
+      {uploadingRecording && (
+        <div className="fixed inset-0 z-[9999] bg-slate-950/95 backdrop-blur-md flex flex-col items-center justify-center gap-6">
+          <div className="w-16 h-16 rounded-2xl bg-indigo-600/15 border border-indigo-500/30 flex items-center justify-center">
+            <span className="w-7 h-7 border-[3px] border-indigo-400 border-t-transparent rounded-full animate-spin" />
+          </div>
+          <div className="text-center space-y-1">
+            <p className="text-sm font-bold text-white uppercase tracking-widest font-sans">Saving Class Recording</p>
+            <p className="text-xs text-slate-400 font-mono">{uploadProgress || "Processing..."}</p>
+          </div>
+          <p className="text-[10px] text-slate-500 font-mono max-w-xs text-center leading-relaxed">
+            Please wait while your class session recording is being saved. Students will be able to replay it once this completes.
+          </p>
+        </div>
+      )}
+
       {/* Main workspace layout: webcam/avatar grid on left, sliders or messages on right */}
       <div className="flex-1 flex overflow-hidden relative">
 
@@ -1476,7 +2201,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                 ) : (
                   <video
                     ref={(el) => {
-                      const rStream = remoteStreams[meetingState.screenShareBy!];
+                      const rStream = remoteScreenStreams[meetingState.screenShareBy!];
                       if (el && rStream) {
                         el.srcObject = rStream;
                       }
@@ -1504,7 +2229,11 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                 <div className="flex-shrink-0 w-44 xl:w-full aspect-video bg-slate-900 border border-white/5 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-md">
                   {videoEnabled ? (
                     <video 
-                      ref={videoRef} 
+                      ref={(el) => {
+                        if (el && localStream) {
+                          el.srcObject = localStream;
+                        }
+                      }}
                       autoPlay 
                       playsInline 
                       muted 
@@ -1522,11 +2251,23 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
                 {/* Rest of students */}
                 {activeParticipants.map((p) => (
-                  <div key={p.id} className="flex-shrink-0 w-44 xl:w-full aspect-video bg-slate-900 border border-white/5 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-md shadow-slate-950/20">
+                  <div key={p.id} className={`flex-shrink-0 w-44 xl:w-full aspect-video bg-slate-900 border rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-md shadow-slate-950/20 group ${
+                    activeSpeakerId === p.id
+                      ? "border-indigo-500 ring-1 ring-indigo-500/20 shadow-[0_0_15px_rgba(99,102,241,0.2)]"
+                      : "border-white/5"
+                  }`}>
                     <RemoteVideo p={p} stream={remoteStreams[p.id]} />
-                    <div className="absolute bottom-2 left-2 bg-slate-950/85 backdrop-blur-md py-1 px-2 rounded-lg text-[9.5px] border border-white/5 z-10">
-                      {p.name}
+                    <div className="absolute bottom-2 left-2 bg-slate-950/85 backdrop-blur-md py-1 px-2 rounded-lg text-[9.5px] border border-white/5 z-10 flex items-center gap-1">
+                      <span>{p.name}</span>
+                      {activeSpeakerId === p.id && p.micEnabled && (
+                        <span className="flex items-center gap-0.5 ml-1">
+                          <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_100ms]" />
+                          <span className="w-0.5 h-2.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_300ms]" />
+                          <span className="w-0.5 h-1 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_200ms]" />
+                        </span>
+                      )}
                     </div>
+                    {renderParticipantHostControls(p)}
                   </div>
                 ))}
               </div>
@@ -1537,14 +2278,22 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                 <div className={`${getGridLayoutClass(activeParticipants.length + 1)} w-full h-full`}>
                   
                   {/* User's block */}
-                  <div className={`bg-slate-900 border border-white/10 rounded-3xl relative overflow-hidden flex flex-col items-center justify-center group shadow-2xl transition-all duration-300 ${
+                  <div className={`bg-slate-900 border rounded-3xl relative overflow-hidden flex flex-col items-center justify-center group shadow-2xl transition-all duration-300 ${
+                    activeSpeakerId === user.uid
+                      ? "border-indigo-500 ring-2 ring-indigo-500/20 shadow-[0_0_25px_rgba(99,102,241,0.25)]"
+                      : "border-white/10"
+                  } ${
                     activeParticipants.length === 0 
                       ? "w-full max-w-4xl aspect-video mx-auto" 
                       : "w-full aspect-video"
                   }`}>
                     {videoEnabled ? (
                       <video 
-                        ref={videoRef} 
+                        ref={(el) => {
+                          if (el && localStream) {
+                            el.srcObject = localStream;
+                          }
+                        }}
                         autoPlay 
                         playsInline 
                         muted 
@@ -1558,66 +2307,101 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                     
                     {/* User metadata tag */}
                     <div className="absolute bottom-4 left-4 bg-slate-950/80 backdrop-blur-md py-1.5 px-3 rounded-xl text-[11px] font-medium border border-white/10 flex items-center gap-2">
-                      <span className="text-emerald-400 animate-pulse">●</span> {user.name} (You)
+                      <span className="text-emerald-400 animate-pulse">●</span>
+                      <span>{user.name} (You)</span>
+                      {activeSpeakerId === user.uid && micEnabled && (
+                        <span className="flex items-center gap-0.5 ml-1.5">
+                          <span className="w-0.5 h-2 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_100ms]" />
+                          <span className="w-0.5 h-3 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_300ms]" />
+                          <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_200ms]" />
+                        </span>
+                      )}
                     </div>
                   </div>
 
                   {/* REAL CLASSROOM PARTICIPANTS */}
                   {activeParticipants.map((p) => (
-                    <div key={p.id} className="bg-slate-900 border border-white/5 rounded-3xl relative overflow-hidden aspect-video flex flex-col items-center justify-center shadow-2xl transition-all duration-300 w-full">
+                    <div key={p.id} className={`bg-slate-900 border rounded-3xl relative overflow-hidden aspect-video flex flex-col items-center justify-center shadow-2xl transition-all duration-300 w-full group ${
+                      activeSpeakerId === p.id
+                        ? "border-indigo-500 ring-2 ring-indigo-500/20 shadow-[0_0_25px_rgba(99,102,241,0.25)]"
+                        : "border-white/5"
+                    }`}>
                       <RemoteVideo p={p} stream={remoteStreams[p.id]} />
                       
                       <div className="absolute bottom-4 left-4 bg-slate-950/80 backdrop-blur-md py-1.5 px-3 rounded-xl text-[11px] font-medium border border-white/10 flex items-center gap-2">
-                        <span className={p.videoEnabled ? "text-emerald-400 animate-pulse shadow-[0_0_5px_#22c55e]" : "text-slate-500"}>●</span> {p.name}
+                        <span className={p.videoEnabled ? "text-emerald-400 animate-pulse shadow-[0_0_5px_#22c55e]" : "text-slate-500"}>●</span>
+                        <span>{p.name}</span>
+                        {activeSpeakerId === p.id && p.micEnabled && (
+                          <span className="flex items-center gap-0.5 ml-1.5">
+                            <span className="w-0.5 h-2 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_100ms]" />
+                            <span className="w-0.5 h-3 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_300ms]" />
+                            <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_200ms]" />
+                          </span>
+                        )}
                         {!p.micEnabled && <span className="text-[10px] bg-red-500/10 text-red-400 px-1.5 py-0.5 rounded border border-red-500/20 font-bold font-mono uppercase">Muted</span>}
                       </div>
+                      {renderParticipantHostControls(p)}
                     </div>
                   ))}
-
                 </div>
               )}
-
-              {/* Sidebar Layout */}
               {meetLayout === 'sidebar' && (
                 <div className="flex flex-col lg:flex-row gap-5 w-full h-full max-h-[75vh] overflow-hidden items-center justify-center">
                   {/* Main spotlight card */}
-                  <div className="flex-1 bg-slate-900 border border-white/10 rounded-3xl relative overflow-hidden flex flex-col items-center justify-center shadow-2xl w-full h-full min-h-[300px] aspect-video">
-                    {activeParticipants.length > 0 ? (
-                      (() => {
-                        const focusUser = activeParticipants[0];
-                        return (
+                  {(() => {
+                    const focusUser = spotlightParticipant;
+                    return (
+                      <div className={`flex-1 bg-slate-900 border rounded-3xl relative overflow-hidden flex flex-col items-center justify-center shadow-2xl w-full h-full min-h-[300px] aspect-video group ${
+                        focusUser && activeSpeakerId === focusUser.id
+                          ? "border-indigo-500 ring-2 ring-indigo-500/20 shadow-[0_0_25px_rgba(99,102,241,0.25)]"
+                          : "border-white/10"
+                      }`}>
+                        {focusUser ? (
                           <>
                             <RemoteVideo p={focusUser} stream={remoteStreams[focusUser.id]} />
                             <div className="absolute top-4 right-4 bg-indigo-600 text-white text-[10px] font-mono font-bold uppercase tracking-wider px-2.5 py-1 rounded-full shadow-lg z-10">
                               Active Speaker
                             </div>
                             <div className="absolute bottom-4 left-4 bg-slate-950/80 backdrop-blur-md py-1.5 px-3 rounded-xl text-xs font-semibold border border-white/10 flex items-center gap-2 z-10">
-                              <span className="text-emerald-400 animate-pulse">●</span> {focusUser.name}
+                              <span className="text-emerald-400 animate-pulse">●</span>
+                              <span>{focusUser.name}</span>
+                              {activeSpeakerId === focusUser.id && focusUser.micEnabled && (
+                                <span className="flex items-center gap-0.5 ml-1.5">
+                                  <span className="w-0.5 h-2 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_100ms]" />
+                                  <span className="w-0.5 h-3 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_300ms]" />
+                                  <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_200ms]" />
+                                </span>
+                              )}
+                            </div>
+                            {renderParticipantHostControls(focusUser)}
+                          </>
+                        ) : (
+                          <>
+                            {videoEnabled ? (
+                              <video 
+                                ref={(el) => {
+                                  if (el && localStream) {
+                                    el.srcObject = localStream;
+                                  }
+                                }}
+                                autoPlay 
+                                playsInline 
+                                muted 
+                                className="w-full h-full object-cover scale-x-[-1]"
+                              />
+                            ) : (
+                              <div className="w-24 h-24 rounded-2xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold text-4xl uppercase">
+                                {user.name.charAt(0)}
+                              </div>
+                            )}
+                            <div className="absolute bottom-4 left-4 bg-slate-950/80 backdrop-blur-md py-1.5 px-3 rounded-xl text-xs font-semibold border border-white/10 flex items-center gap-2">
+                              <span className="text-emerald-400">●</span> {user.name} (You)
                             </div>
                           </>
-                        );
-                      })()
-                    ) : (
-                      <>
-                        {videoEnabled ? (
-                          <video 
-                            ref={videoRef} 
-                            autoPlay 
-                            playsInline 
-                            muted 
-                            className="w-full h-full object-cover scale-x-[-1]"
-                          />
-                        ) : (
-                          <div className="w-24 h-24 rounded-2xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold text-4xl uppercase">
-                            {user.name.charAt(0)}
-                          </div>
                         )}
-                        <div className="absolute bottom-4 left-4 bg-slate-950/80 backdrop-blur-md py-1.5 px-3 rounded-xl text-xs font-semibold border border-white/10 flex items-center gap-2">
-                          <span className="text-emerald-400">●</span> {user.name} (You)
-                        </div>
-                      </>
-                    )}
-                  </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* Sidebar column */}
                   {activeParticipants.length > 0 && (
@@ -1626,14 +2410,18 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                       <div className="flex-shrink-0 w-44 lg:w-full aspect-video bg-slate-900 border border-white/5 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-md">
                         {videoEnabled ? (
                           <video 
-                            ref={videoRef} 
+                            ref={(el) => {
+                              if (el && localStream) {
+                                el.srcObject = localStream;
+                              }
+                            }}
                             autoPlay 
                             playsInline 
                             muted 
                             className="w-full h-full object-cover scale-x-[-1]"
                           />
                         ) : (
-                          <div className="w-10 h-10 rounded-lg bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold text-sm uppercase">
+                          <div className="w-10 h-10 rounded-lg bg-indigo-650/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold text-sm uppercase">
                             {user.name.charAt(0)}
                           </div>
                         )}
@@ -1642,15 +2430,30 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                         </div>
                       </div>
 
-                      {/* Rest of students */}
-                      {activeParticipants.slice(1).map((p) => (
-                        <div key={p.id} className="flex-shrink-0 w-44 lg:w-full aspect-video bg-slate-900 border border-white/5 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-md shadow-slate-950/20">
-                          <RemoteVideo p={p} stream={remoteStreams[p.id]} />
-                          <div className="absolute bottom-2 left-2 bg-slate-950/85 backdrop-blur-md py-1 px-2 rounded-lg text-[9.5px] border border-white/5 z-10">
-                            {p.name}
+                      {/* Rest of students (excluding spotlight user) */}
+                      {(() => {
+                        const focusUser = spotlightParticipant;
+                        return activeParticipants.filter((p) => !focusUser || p.id !== focusUser.id).map((p) => (
+                          <div key={p.id} className={`flex-shrink-0 w-44 lg:w-full aspect-video bg-slate-900 border rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-md shadow-slate-950/20 group ${
+                            activeSpeakerId === p.id
+                              ? "border-indigo-500 ring-1 ring-indigo-500/20 shadow-[0_0_15px_rgba(99,102,241,0.2)]"
+                              : "border-white/5"
+                          }`}>
+                            <RemoteVideo p={p} stream={remoteStreams[p.id]} />
+                            <div className="absolute bottom-2 left-2 bg-slate-950/85 backdrop-blur-md py-1 px-2 rounded-lg text-[9.5px] border border-white/5 z-10 flex items-center gap-1">
+                              <span>{p.name}</span>
+                              {activeSpeakerId === p.id && p.micEnabled && (
+                                <span className="flex items-center gap-0.5 ml-1">
+                                  <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_100ms]" />
+                                  <span className="w-0.5 h-2.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_300ms]" />
+                                  <span className="w-0.5 h-1 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_200ms]" />
+                                </span>
+                              )}
+                            </div>
+                            {renderParticipantHostControls(p)}
                           </div>
-                        </div>
-                      ))}
+                        ));
+                      })()}
                     </div>
                   )}
                 </div>
@@ -1659,48 +2462,64 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
               {/* Spotlight Layout */}
               {meetLayout === 'spotlight' && (
                 <div className="w-full h-full max-h-[75vh] flex items-center justify-center">
-                  <div className="w-full max-w-4xl aspect-video bg-slate-900 border border-white/10 rounded-3xl relative overflow-hidden flex flex-col items-center justify-center shadow-2xl">
-                    {activeParticipants.length > 0 ? (
-                      (() => {
-                        const focusUser = activeParticipants[0];
-                        return (
+                  {(() => {
+                    const focusUser = spotlightParticipant;
+                    return (
+                      <div className={`w-full max-w-4xl aspect-video bg-slate-900 border rounded-3xl relative overflow-hidden flex flex-col items-center justify-center shadow-2xl group ${
+                        focusUser && activeSpeakerId === focusUser.id
+                          ? "border-indigo-500 ring-2 ring-indigo-500/20 shadow-[0_0_25px_rgba(99,102,241,0.25)]"
+                          : "border-white/10"
+                      }`}>
+                        {focusUser ? (
                           <>
                             <RemoteVideo p={focusUser} stream={remoteStreams[focusUser.id]} />
                             <div className="absolute top-4 left-4 bg-indigo-600 text-white text-[10px] font-mono font-bold uppercase tracking-widest px-2.5 py-1 rounded-full flex items-center gap-1 shadow-lg z-10">
                               <Sparkles className="w-3.5 h-3.5" /> Presenter Spotlight
                             </div>
                             <div className="absolute bottom-4 left-4 bg-slate-950/85 backdrop-blur-md py-2 px-3.5 rounded-xl text-xs font-semibold border border-white/10 flex items-center gap-2 z-10">
-                              <span className="text-emerald-400 animate-pulse">●</span> {focusUser.name}
+                              <span className="text-emerald-400 animate-pulse">●</span>
+                              <span>{focusUser.name}</span>
+                              {activeSpeakerId === focusUser.id && focusUser.micEnabled && (
+                                <span className="flex items-center gap-0.5 ml-1.5">
+                                  <span className="w-0.5 h-2 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_100ms]" />
+                                  <span className="w-0.5 h-3 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_300ms]" />
+                                  <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-[bounce_1s_infinite_200ms]" />
+                                </span>
+                              )}
+                            </div>
+                            {renderParticipantHostControls(focusUser)}
+                          </>
+                        ) : (
+                          <>
+                            {videoEnabled ? (
+                              <video 
+                                ref={(el) => {
+                                  if (el && localStream) {
+                                    el.srcObject = localStream;
+                                  }
+                                }}
+                                autoPlay 
+                                playsInline 
+                                muted 
+                                className="w-full h-full object-cover scale-x-[-1]"
+                              />
+                            ) : (
+                              <div className="w-28 h-28 rounded-3xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold text-5xl uppercase">
+                                {user.name.charAt(0)}
+                              </div>
+                            )}
+                            <div className="absolute bottom-4 left-4 bg-slate-950/85 backdrop-blur-md py-2 px-3.5 rounded-xl text-xs font-semibold border border-white/10 flex items-center gap-2">
+                              <span className="text-emerald-400">●</span> {user.name} (You)
                             </div>
                           </>
-                        );
-                      })()
-                    ) : (
-                      <>
-                        {videoEnabled ? (
-                          <video 
-                            ref={videoRef} 
-                            autoPlay 
-                            playsInline 
-                            muted 
-                            className="w-full h-full object-cover scale-x-[-1]"
-                          />
-                        ) : (
-                          <div className="w-28 h-28 rounded-3xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold text-5xl uppercase">
-                            {user.name.charAt(0)}
-                          </div>
                         )}
-                        <div className="absolute bottom-4 left-4 bg-slate-950/85 backdrop-blur-md py-2 px-3.5 rounded-xl text-xs font-semibold border border-white/10 flex items-center gap-2">
-                          <span className="text-emerald-400">●</span> {user.name} (You)
-                        </div>
-                      </>
-                    )}
-                  </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
             </>
           )}
-
         </div>
 
         {/* Floating Draggable & Minimizable Checkpoints Progress Tracker (Moved to Settings Modal) */}
@@ -1952,9 +2771,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                         <span className="font-bold text-indigo-400">{user.name} (You)</span>
                         <span className="text-[9px] uppercase font-mono block text-slate-500">{user.role}</span>
                       </div>
-                      <div className="flex items-center gap-2 text-slate-400 font-mono text-[10px]">
-                        <span>{videoEnabled ? "🎥" : "❌"}</span>
-                        <span>{micEnabled ? "🎙️" : "🔇"}</span>
+                      <div className="flex items-center gap-1.5 text-slate-400">
+                        {videoEnabled ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5 text-red-400" />}
+                        {micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5 text-red-400" />}
                       </div>
                     </div>
 
@@ -1994,11 +2813,23 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                               >
                                 {p.videoEnabled ? <Video className="w-3 h-3" /> : <VideoOff className="w-3 h-3" />}
                               </button>
+                              {p.handRaised && (
+                                <button
+                                  onClick={async () => {
+                                    const pRef = doc(db, `meetings/${meeting.id}/presence`, p.id);
+                                    await updateDoc(pRef, { handRaised: false, handRaisedAt: null });
+                                  }}
+                                  className="p-1.5 rounded-lg border bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20 transition-all cursor-pointer"
+                                  title="Lower hand"
+                                >
+                                  <Hand className="w-3 h-3" />
+                                </button>
+                              )}
                             </div>
                           ) : (
-                            <div className="flex gap-2 text-slate-400 font-mono text-[10px]">
-                              <span>{p.videoEnabled ? "🎥" : "❌"}</span>
-                              <span>{p.micEnabled ? "🎙️" : "🔇"}</span>
+                            <div className="flex gap-1.5 text-slate-400">
+                              {p.videoEnabled ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5 text-red-400" />}
+                              {p.micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5 text-red-400" />}
                             </div>
                           )}
                         </div>
@@ -2117,12 +2948,91 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       {/* Meet Bottom Action Control Bar */}
       <div className="p-5 border-t border-white/10 bg-slate-900/90 backdrop-blur-md flex items-center justify-between z-20">
         
-        {/* Dynamic call metadata */}
-        <div className="flex items-center gap-3">
-          <div className="text-xs text-slate-300 font-mono flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
-            <span>{activeParticipants.length + 1} present</span>
+        {/* Dynamic call metadata — clickable to open participants sidebar */}
+        <div className="flex items-center gap-3 bg-slate-950/40 px-3 py-1.5 rounded-2xl border border-white/5">
+          {/* Overlapping profile bubbles */}
+          <div className="flex -space-x-2 mr-1">
+            {/* Self bubble */}
+            <div 
+              className="w-6 h-6 rounded-full bg-gradient-to-br from-indigo-550 to-purple-600 border border-slate-900 flex items-center justify-center text-[10px] font-bold text-white uppercase shadow-md cursor-pointer hover:scale-105 transition-transform"
+              onClick={() => {
+                setShowParticipantsSidebar(true);
+                setChatOpen(false);
+              }}
+              title={`${user.name} (You)`}
+            >
+              {user.name.charAt(0)}
+            </div>
+
+            {/* Remote participants bubbles */}
+            {activeParticipants.slice(0, 3).map((p, idx) => {
+              const colors = [
+                "from-emerald-500 to-teal-600",
+                "from-sky-500 to-blue-600",
+                "from-amber-500 to-orange-600",
+                "from-pink-500 to-rose-600"
+              ];
+              const colorClass = colors[idx % colors.length];
+
+              return (
+                <div
+                  key={p.id}
+                  className={`w-6 h-6 rounded-full bg-gradient-to-br ${colorClass} border border-slate-900 flex items-center justify-center text-[10px] font-bold text-white uppercase shadow-md cursor-pointer hover:scale-105 transition-transform`}
+                  onClick={() => {
+                    setShowParticipantsSidebar(true);
+                    setChatOpen(false);
+                  }}
+                  title={p.name}
+                >
+                  {p.name.charAt(0)}
+                </div>
+              );
+            })}
+
+            {/* Overflow indicator bubble */}
+            {activeParticipants.length > 3 && (
+              <div 
+                className="w-6 h-6 rounded-full bg-slate-800 border border-slate-900 flex items-center justify-center text-[8.5px] font-extrabold text-slate-350 shadow-md cursor-pointer hover:scale-105 transition-transform"
+                onClick={() => {
+                  setShowParticipantsSidebar(true);
+                  setChatOpen(false);
+                }}
+                title="View all participants"
+              >
+                +{activeParticipants.length - 3}
+              </div>
+            )}
           </div>
+
+          <button
+            onClick={() => {
+              setShowParticipantsSidebar(true);
+              setChatOpen(false);
+            }}
+            className="text-xs text-slate-300 font-semibold font-mono flex items-center gap-1.5 hover:text-white transition-colors cursor-pointer"
+            title="View participants list"
+          >
+            <span>{activeParticipants.length + 1} present</span>
+          </button>
+
+
+          {/* Hand-raise queue indicator — only shown when there are hand raisers */}
+          {allHandRaisers.length > 0 && (
+            <>
+              <div className="w-px h-4 bg-white/10" />
+              <button
+                onClick={() => {
+                  setShowParticipantsSidebar(true);
+                  setChatOpen(false);
+                }}
+                className="flex items-center gap-1.5 px-2 py-0.5 bg-amber-500/15 border border-amber-500/30 text-amber-400 rounded-lg text-[10px] font-bold cursor-pointer hover:bg-amber-500/25 transition-all animate-pulse"
+                title="View hand-raise queue"
+              >
+                <Hand className="w-3 h-3" />
+                <span>{allHandRaisers.length} raised</span>
+              </button>
+            </>
+          )}
         </div>
 
         {/* Main calling interactors */}
@@ -2188,79 +3098,73 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
             {videoEnabled ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
           </button>
 
-          <button
-            onClick={() => setChatOpen(!chatOpen)}
-            className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
-              chatOpen ? "bg-indigo-600/30 border-indigo-505/50 text-indigo-400" : "bg-slate-800 border-white/10 text-slate-300"
-            }`}
-            title="Classroom chatroom"
-          >
-            <MessageSquare className="w-4 h-4" />
-          </button>
+          {!isHost && (
+            <button
+              onClick={toggleHand}
+              className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
+                handRaised ? "bg-amber-500/20 border-amber-500/50 text-amber-400" : "bg-slate-800 border-white/10 text-slate-300"
+              }`}
+              title={handRaised ? "Lower Hand" : "Raise Hand"}
+            >
+              <Hand className={`w-4 h-4 ${handRaised ? "fill-amber-400 text-amber-400" : ""}`} />
+            </button>
+          )}
 
           <button
-            onClick={toggleHand}
+            onClick={() => {
+              if (screenStreamRef.current) {
+                stopScreenShare();
+              } else {
+                startScreenShare();
+              }
+            }}
             className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
-              handRaised ? "bg-amber-500/20 border-amber-500/50 text-amber-400" : "bg-slate-800 border-white/10 text-slate-300"
-            }`}
-            title={handRaised ? "Lower Hand" : "Raise Hand"}
-          >
-            <Hand className={`w-4 h-4 ${handRaised ? "fill-amber-400 text-amber-400" : ""}`} />
-          </button>
-
-          <button
-            onClick={screenStream ? () => stopScreenShare() : startScreenShare}
-            className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
-              screenStream ? "bg-emerald-600/30 border-emerald-505/50 text-emerald-400 animate-pulse" : "bg-slate-800 border-white/10 text-slate-300"
+              screenStream ? "bg-emerald-600/30 border-emerald-500/50 text-emerald-400 animate-pulse" : "bg-slate-800 border-white/10 text-slate-300"
             }`}
             title={screenStream ? "Stop Sharing Screen" : "Share Screen"}
           >
             <Monitor className="w-4 h-4" />
           </button>
 
-          <button
-            onClick={() => {
-              // Ensure active settings tab is appropriate for user role
-              setActiveSettingsTab(isHost ? 'controls' : 'checkpoints');
-              setShowSettingsModal(true);
-            }}
-            className="p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 bg-slate-800 border-white/10 text-slate-300"
-            title="Session Settings & Control Room"
-          >
-            <Settings className="w-4 h-4" />
-          </button>
-
-          {isHost ? (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={onLeave}
-                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-xl border border-white/10 flex items-center gap-1.5 cursor-pointer transition-all"
-                title="Leave meeting temporarily (Meeting stays active)"
-              >
-                <LogOut className="w-3.5 h-3.5 text-slate-400" />
-                <span className="hidden sm:inline">Leave Class</span>
-              </button>
-              <button
-                onClick={handleEndMeeting}
-                className="px-3 py-2 bg-red-650 hover:bg-red-600 text-white text-xs font-bold rounded-xl shadow-lg flex items-center gap-1.5 cursor-pointer transition-all border border-red-500/30"
-                title="Finish meeting permanently for everyone"
-              >
-                <PhoneOff className="w-3.5 h-3.5" />
-                <span>Finish Meeting</span>
-              </button>
-            </div>
-          ) : (
+          {/* Presenter Tools popup toggle — only while screen sharing is active */}
+          {screenStream && (
             <button
-              onClick={onLeave}
-              className="p-3.5 bg-red-600 hover:bg-red-500 text-white rounded-full shadow-lg flex items-center justify-center cursor-pointer transition-all border border-red-500/40"
-              title="Leave Class"
+              onClick={() => setShowMinimizedPopup((prev) => !prev)}
+              className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
+                showMinimizedPopup
+                  ? "bg-indigo-600/30 border-indigo-500/50 text-indigo-400"
+                  : "bg-slate-800 border-white/10 text-slate-300"
+              }`}
+              title={showMinimizedPopup ? "Hide Presenter Tools" : "Show Presenter Tools"}
             >
-              <PhoneOff className="w-4.5 h-4.5" />
+              <Minimize2 className="w-4 h-4" />
             </button>
           )}
+
+          {isHost && (
+            <button
+              onClick={() => {
+                // Ensure active settings tab is appropriate for user role
+                setActiveSettingsTab('controls');
+                setShowSettingsModal(true);
+              }}
+              className="p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 bg-slate-800 border-white/10 text-slate-300"
+              title="Session Settings & Control Room"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+          )}
+
+          <button
+            onClick={() => setShowLeaveModal(true)}
+            className="p-3.5 bg-red-600 hover:bg-red-500 text-white rounded-full shadow-lg flex items-center justify-center cursor-pointer transition-all border border-red-500/40"
+            title="Leave / Finish Session"
+          >
+            <PhoneOff className="w-4.5 h-4.5" />
+          </button>
         </div>
 
-        {/* Profile score / grade status */}
+        {/* Profile score / chat status */}
         <div className="flex items-center gap-3">
           {!isHost && (
             <div className="px-2.5 py-1 bg-indigo-500/10 border border-indigo-500/20 rounded-lg flex items-center gap-1.5 text-[11px] font-bold text-indigo-400">
@@ -2268,113 +3172,426 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
               <span>Score: <span className="text-white font-mono">{scorePercentage}%</span></span>
             </div>
           )}
-          <span className="hidden sm:inline text-slate-400 text-xs truncate max-w-[100px]" title={user.name}>{user.name.split(" ")[0]}</span>
-          <span className="bg-indigo-500/10 text-indigo-400 uppercase font-mono tracking-widest text-[9px] px-1.5 py-0.5 rounded border border-indigo-500/20 font-extrabold">{user.role}</span>
+          <button
+            onClick={() => setChatOpen(!chatOpen)}
+            className={`p-2.5 rounded-full border transition-all cursor-pointer relative ${
+              chatOpen
+                ? "bg-indigo-600/30 border-indigo-500/50 text-indigo-400"
+                : "bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700"
+            }`}
+            title="Classroom Chat"
+          >
+            <MessageSquare className="w-4 h-4" />
+            {unreadChatCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 bg-indigo-600 text-white text-[9px] font-bold w-4.5 h-4.5 rounded-full flex items-center justify-center border border-slate-900 animate-pulse">
+                {unreadChatCount}
+              </span>
+            )}
+          </button>
         </div>
 
       </div>
 
-      {/* Draggable Minimized Screen Sharer Controls Popup */}
-      {showMinimizedPopup && (
-        <div
-          style={{
-            position: 'fixed',
-            left: `${minPopupPos.x}px`,
-            top: `${minPopupPos.y}px`,
-            zIndex: 9999,
-          }}
-          className={`w-64 bg-slate-950/95 backdrop-blur-md border border-indigo-500/40 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] overflow-hidden text-white transition-all duration-150 ${
-            minPopupDragging ? "opacity-90 scale-[0.98]" : "opacity-100"
-          }`}
-        >
-          {/* Header / Drag Handle */}
-          <div
-            onMouseDown={handleMinPopupMouseDown}
-            onTouchStart={handleMinPopupTouchStart}
-            className="bg-indigo-950/80 px-3 py-2 border-b border-white/10 flex items-center justify-between cursor-grab active:cursor-grabbing select-none text-[10px] font-bold uppercase tracking-wider text-indigo-300"
-          >
-            <span className="flex items-center gap-1.5 pointer-events-none">
-              <Monitor className="w-3 h-3 text-indigo-400 animate-pulse" />
-              <span>Presenter Tools</span>
-            </span>
-            <button
-              onClick={() => setShowMinimizedPopup(false)}
-              className="text-slate-400 hover:text-white font-bold cursor-pointer"
-              title="Dismiss popup"
-            >
-              ✕
-            </button>
-          </div>
-
-          {/* Action controls row */}
-          <div className="p-3 bg-slate-900/50 flex items-center justify-around gap-2 border-b border-white/5">
-            {/* Mic toggle */}
-            <button
-              onClick={() => setMicEnabled(!micEnabled)}
-              className={`p-2 rounded-xl border transition-all cursor-pointer ${
-                micEnabled
-                  ? "bg-slate-800 border-white/10 text-white hover:bg-slate-700"
-                  : "bg-red-500/20 border-red-500/30 text-red-400"
-              }`}
-              title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
-            >
-              {micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5" />}
-            </button>
-
-            {/* Cam toggle */}
-            <button
-              onClick={() => setVideoEnabled(!videoEnabled)}
-              className={`p-2 rounded-xl border transition-all cursor-pointer ${
-                videoEnabled
-                  ? "bg-slate-800 border-white/10 text-white hover:bg-slate-700"
-                  : "bg-red-500/20 border-red-500/30 text-red-400"
-              }`}
-              title={videoEnabled ? "Stop Camera" : "Start Camera"}
-            >
-              {videoEnabled ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5" />}
-            </button>
-
-            {/* Raise/Lower hand */}
-            <button
-              onClick={toggleHand}
-              className={`p-2 rounded-xl border transition-all cursor-pointer ${
-                handRaised
-                  ? "bg-amber-500/20 border-amber-500/30 text-amber-400 font-bold"
-                  : "bg-slate-800 border-white/10 text-slate-300"
-              }`}
-              title={handRaised ? "Lower Hand" : "Raise Hand"}
-            >
-              <Hand className={`w-3.5 h-3.5 ${handRaised ? "fill-amber-400 text-amber-400" : ""}`} />
-            </button>
-
-            {/* Stop Screenshare */}
-            <button
-              onClick={() => stopScreenShare()}
-              className="p-2 bg-red-600 hover:bg-red-500 border border-red-500/30 text-white rounded-xl transition-all cursor-pointer shadow-md"
-              title="Stop sharing screen"
-            >
-              <PhoneOff className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {/* Hand Raisers List Queue inside Popup */}
-          <div className="p-3 space-y-1.5">
-            <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400 font-mono block">Queue ({allHandRaisers.length})</span>
-            {allHandRaisers.length === 0 ? (
-              <p className="text-[9.5px] text-slate-500 italic font-mono">No hands raised.</p>
-            ) : (
-              <div className="space-y-1 max-h-24 overflow-y-auto pr-0.5">
-                {allHandRaisers.map((p, idx) => (
-                  <div key={p.id} className="p-1.5 bg-amber-500/5 border border-amber-500/10 rounded-lg flex items-center justify-between text-[10px]">
-                    <span className="font-semibold text-slate-300 truncate max-w-[120px]">#{idx + 1} {p.name}</span>
-                    <Hand className="w-3 h-3 text-amber-400 animate-pulse flex-shrink-0" />
-                  </div>
-                ))}
-              </div>
-            )}
+      {/* Leave Modal */}
+      {showLeaveModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[110] p-4">
+          <div className="bg-slate-900 border border-white/10 p-6 rounded-[24px] max-w-sm w-full text-center shadow-[0_0_50px_rgba(0,0,0,0.5)] scale-in-animation">
+            <h3 className="text-lg font-bold text-white mb-2">Leave Session</h3>
+            <p className="text-slate-400 text-xs leading-relaxed mb-6">
+              Do you want to leave the class, or finish the meeting for everyone?
+            </p>
+            <div className="space-y-3">
+              <button
+                onClick={async () => {
+                  setShowLeaveModal(false);
+                  // Stop screen sharing before leaving to clean up state
+                  if (screenStreamRef.current) {
+                    await stopScreenShare();
+                  }
+                  onLeave();
+                }}
+                className="w-full py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition-all cursor-pointer border border-white/10"
+              >
+                Leave Class
+              </button>
+              {isHost && (
+                <button
+                  onClick={() => {
+                    setShowLeaveModal(false);
+                    setShowFinishConfirmModal(true);
+                  }}
+                  className="w-full py-3 bg-red-600/10 hover:bg-red-600/20 text-red-500 font-bold text-xs rounded-xl transition-all cursor-pointer border border-red-500/20"
+                >
+                  Finish Meeting
+                </button>
+              )}
+              <button
+                onClick={() => setShowLeaveModal(false)}
+                className="w-full py-2 text-slate-400 hover:text-white text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
+
+      {/* Finish Confirmation Modal */}
+      {showFinishConfirmModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[110] p-4">
+          <div className="bg-slate-900 border border-red-500/30 p-6 rounded-[24px] max-w-sm w-full text-center shadow-[0_0_50px_rgba(239,68,68,0.2)] scale-in-animation">
+            <div className="w-12 h-12 rounded-full bg-red-500/20 border border-red-500/30 flex items-center justify-center mx-auto mb-4 text-red-500">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-bold text-white mb-2">Finish Meeting?</h3>
+            <p className="text-slate-400 text-xs leading-relaxed mb-6">
+              This will permanently end the session for all participants and generate the final recording.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowFinishConfirmModal(false)}
+                className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition-all cursor-pointer border border-white/10"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setShowFinishConfirmModal(false);
+                  handleEndMeeting();
+                }}
+                className="flex-1 py-3 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-xl transition-all cursor-pointer shadow-lg border border-red-500/40"
+              >
+                Yes, Finish
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Participants Sidebar — opens when clicking present count or hand-raise indicator */}
+      {showParticipantsSidebar && (
+        <div className="fixed inset-y-0 right-0 w-80 bg-slate-900/97 backdrop-blur-xl border-l border-white/10 flex flex-col z-50 shadow-2xl">
+          {/* Header */}
+          <div className="px-5 py-4 border-b border-white/10 flex items-center justify-between bg-slate-950/60">
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-indigo-400" />
+              <span className="font-bold text-sm text-white">Participants</span>
+              <span className="text-[10px] font-mono text-slate-400 bg-slate-800 px-1.5 py-0.5 rounded">{activeParticipants.length + 1}</span>
+            </div>
+            <button
+              onClick={() => setShowParticipantsSidebar(false)}
+              className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-white/10 transition-all cursor-pointer"
+            >✕</button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            {/* Hand Raisers Queue (sorted by raise time) */}
+            {allHandRaisers.length > 0 && (
+              <div className="space-y-2">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-amber-400 font-mono flex items-center gap-1.5">
+                  <Hand className="w-3.5 h-3.5" />
+                  Hand Queue ({allHandRaisers.length})
+                </span>
+                <div className="space-y-1.5">
+                  {allHandRaisers.map((p, idx) => (
+                    <div key={p.id} className="p-3 bg-amber-500/5 border border-amber-500/20 rounded-xl flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <span className="text-amber-400 font-mono font-bold text-xs w-5">#{idx + 1}</span>
+                        <div className="w-8 h-8 rounded-full bg-amber-500/15 border border-amber-500/20 flex items-center justify-center text-amber-300 font-bold text-sm uppercase flex-shrink-0">
+                          {p.name.charAt(0)}
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold text-slate-200 block leading-tight">{p.name}</span>
+                          <span className="text-[9px] uppercase tracking-wider font-mono text-slate-500">{p.role}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Hand className="w-3.5 h-3.5 text-amber-400 animate-bounce" />
+                        {isHost && p.id !== user.uid && (
+                          <button
+                            onClick={async () => {
+                              const pRef = doc(db, `meetings/${meeting.id}/presence`, p.id);
+                              await updateDoc(pRef, { handRaised: false, handRaisedAt: null });
+                            }}
+                            className="text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 border border-amber-500/20 rounded-lg font-bold transition-all cursor-pointer"
+                          >
+                            Lower
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* All Participants */}
+            <div className="space-y-2">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500 font-mono block">
+                All Participants ({activeParticipants.length + 1})
+              </span>
+
+              {/* Self */}
+              <div className="p-3 bg-slate-950/50 rounded-xl border border-white/5 flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-full bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 font-bold text-sm uppercase flex-shrink-0">
+                    {user.name.charAt(0)}
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold text-indigo-300 block">{user.name} (You)</span>
+                    <span className="text-[9px] uppercase font-mono text-slate-500">{user.role}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5 text-slate-400">
+                  {videoEnabled ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5 text-red-400" />}
+                  {micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5 text-red-400" />}
+                  {handRaised && <Hand className="w-3.5 h-3.5 text-amber-400" />}
+                </div>
+              </div>
+
+              {/* Remote participants — sorted: hand raisers first */}
+              {[...activeParticipants]
+                .sort((a, b) => {
+                  if (a.handRaised && !b.handRaised) return -1;
+                  if (!a.handRaised && b.handRaised) return 1;
+                  const tA = a.handRaisedAt ? new Date(a.handRaisedAt).getTime() : Infinity;
+                  const tB = b.handRaisedAt ? new Date(b.handRaisedAt).getTime() : Infinity;
+                  return tA - tB;
+                })
+                .map((p) => (
+                  <div key={p.id} className={`p-3 rounded-xl border flex items-center justify-between transition-all ${
+                    p.handRaised ? "bg-amber-500/5 border-amber-500/15" : "bg-slate-950/30 border-white/5"
+                  }`}>
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
+                      <div className="w-9 h-9 rounded-full bg-slate-800 border border-white/10 flex items-center justify-center text-slate-300 font-bold text-sm uppercase flex-shrink-0 relative">
+                        {p.name.charAt(0)}
+                        {p.handRaised && (
+                          <span className="absolute -top-1 -right-1 w-4 h-4 bg-amber-400 rounded-full flex items-center justify-center text-[8px]">✋</span>
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <span className="text-xs font-bold text-slate-200 block truncate">{p.name}</span>
+                        <span className="text-[9px] uppercase font-mono text-slate-500">{p.role}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      {isHost && p.id !== user.uid ? (
+                        <>
+                          <button
+                            onClick={() => toggleParticipantMic(p.id, p.micEnabled)}
+                            className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
+                              p.micEnabled ? "bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700" : "bg-red-500/10 border-red-500/20 text-red-400 hover:bg-red-500/20"
+                            }`}
+                            title={p.micEnabled ? "Mute" : "Unmute"}
+                          >
+                            {p.micEnabled ? <Mic className="w-3 h-3" /> : <MicOff className="w-3 h-3" />}
+                          </button>
+                          <button
+                            onClick={() => turnOffParticipantCam(p.id)}
+                            disabled={!p.videoEnabled}
+                            className={`p-1.5 rounded-lg border transition-all cursor-pointer disabled:opacity-30 ${
+                              p.videoEnabled ? "bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700" : "bg-red-500/10 border-red-500/20 text-red-400"
+                            }`}
+                            title="Turn off camera"
+                          >
+                            {p.videoEnabled ? <Video className="w-3 h-3" /> : <VideoOff className="w-3 h-3" />}
+                          </button>
+                          {p.handRaised && (
+                            <button
+                              onClick={async () => {
+                                const pRef = doc(db, `meetings/${meeting.id}/presence`, p.id);
+                                await updateDoc(pRef, { handRaised: false, handRaisedAt: null });
+                              }}
+                              className="p-1.5 rounded-lg border bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20 transition-all cursor-pointer"
+                              title="Lower hand"
+                            >
+                              <Hand className="w-3 h-3" />
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <div className="flex gap-1.5 text-slate-400">
+                          {p.videoEnabled ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5 text-red-400" />}
+                          {p.micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5 text-red-400" />}
+                          {p.handRaised && <Hand className="w-3.5 h-3.5 text-amber-400 animate-bounce" />}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Presenter Tools Popup — PiP or Fallback */}
+      {showMinimizedPopup && (() => {
+        const popupContent = (
+          <div className="flex flex-col h-full w-full bg-slate-950 text-slate-200">
+            {/* Header / Drag Handle (only drag if not in native PiP) */}
+            <div
+              onMouseDown={!pipWindow ? handleMinPopupMouseDown : undefined}
+              onTouchStart={!pipWindow ? handleMinPopupTouchStart : undefined}
+              className="bg-indigo-950/80 px-3 py-2 flex items-center justify-between border-b border-white/10 select-none text-[10px] font-bold uppercase tracking-wider text-indigo-300"
+              style={{ cursor: pipWindow ? 'default' : 'grab' }}
+            >
+              <span className="flex items-center gap-1.5">
+                <Monitor className="w-3 h-3 text-indigo-400 animate-pulse" />
+                <span>Presenter Tools</span>
+              </span>
+              {!pipWindow && (
+                <button
+                  onClick={() => setShowMinimizedPopup(false)}
+                  className="text-slate-400 hover:text-white font-bold cursor-pointer"
+                  title="Dismiss popup"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+
+            {/* Action controls */}
+            <div className="p-3 bg-slate-900/50 flex flex-wrap items-center justify-around gap-2 border-b border-white/5">
+              {/* Mic toggle */}
+              <button
+                onClick={() => setMicEnabled(!micEnabled)}
+                className={`p-2 rounded-xl border transition-all cursor-pointer ${
+                  micEnabled
+                    ? "bg-slate-800 border-white/10 text-white hover:bg-slate-700"
+                    : "bg-red-500/20 border-red-500/30 text-red-400"
+                }`}
+                title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
+              >
+                {micEnabled ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
+              </button>
+
+              {/* Cam toggle */}
+              <button
+                onClick={() => setVideoEnabled(!videoEnabled)}
+                className={`p-2 rounded-xl border transition-all cursor-pointer ${
+                  videoEnabled
+                    ? "bg-slate-800 border-white/10 text-white hover:bg-slate-700"
+                    : "bg-red-500/20 border-red-500/30 text-red-400"
+                }`}
+                title={videoEnabled ? "Stop Camera" : "Start Camera"}
+              >
+                {videoEnabled ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+              </button>
+
+              {/* Host Specific Controls */}
+              {isHost && (
+                <>
+                  <button
+                    onClick={handleMuteAll}
+                    className="p-2 bg-slate-800 border-white/10 text-white hover:bg-slate-700 rounded-xl transition-all cursor-pointer border"
+                    title="Mute All Participants"
+                  >
+                    <MicOff className="w-4 h-4 text-red-400" />
+                  </button>
+                  <button
+                    onClick={handleTurnOffAllCameras}
+                    className="p-2 bg-slate-800 border-white/10 text-white hover:bg-slate-700 rounded-xl transition-all cursor-pointer border"
+                    title="Turn Off All Cameras"
+                  >
+                    <VideoOff className="w-4 h-4 text-red-400" />
+                  </button>
+                  <button
+                    onClick={() => {
+                      window.focus(); // Focus main window
+                      setActiveSettingsTab('controls');
+                      setShowSettingsModal(true);
+                    }}
+                    className="p-2 bg-slate-800 border-white/10 text-white hover:bg-slate-700 rounded-xl transition-all cursor-pointer border"
+                    title="Open Settings in Main Window"
+                  >
+                    <Settings className="w-4 h-4" />
+                  </button>
+                </>
+              )}
+
+              {/* Student Raise/Lower hand */}
+              {!isHost && (
+                <button
+                  onClick={toggleHand}
+                  className={`p-2 rounded-xl border transition-all cursor-pointer ${
+                    handRaised
+                      ? "bg-amber-500/20 border-amber-500/30 text-amber-400 font-bold"
+                      : "bg-slate-800 border-white/10 text-slate-300"
+                  }`}
+                  title={handRaised ? "Lower Hand" : "Raise Hand"}
+                >
+                  <Hand className={`w-4 h-4 ${handRaised ? "fill-amber-400 text-amber-400" : ""}`} />
+                </button>
+              )}
+
+              {/* Leave Meeting */}
+              <button
+                onClick={() => {
+                  window.focus(); // Focus main window
+                  setShowLeaveModal(true);
+                }}
+                className="p-2 bg-red-600 hover:bg-red-500 border border-red-500/30 text-white rounded-xl transition-all cursor-pointer shadow-md"
+                title="Leave Meeting"
+              >
+                <PhoneOff className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Hand Raisers List Queue inside Popup */}
+            <div className="p-3 space-y-2 flex-1 overflow-y-auto">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 font-mono block">Queue ({allHandRaisers.length})</span>
+              {allHandRaisers.length === 0 ? (
+                <p className="text-[10px] text-slate-500 italic font-mono">No hands raised.</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {allHandRaisers.map((p, idx) => (
+                    <div key={p.id} className="p-2 bg-amber-500/5 border border-amber-500/10 rounded-lg flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-300 truncate max-w-[200px]">#{idx + 1} {p.name}</span>
+                      <div className="flex items-center gap-2">
+                        <Hand className="w-3.5 h-3.5 text-amber-400 animate-pulse flex-shrink-0" />
+                        {isHost && p.id !== user.uid && (
+                          <button
+                            onClick={async () => {
+                              const pRef = doc(db, `meetings/${meeting.id}/presence`, p.id);
+                              await updateDoc(pRef, { handRaised: false, handRaisedAt: null });
+                            }}
+                            className="text-[9px] px-2 py-1 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 rounded font-bold cursor-pointer transition-all"
+                          >
+                            Lower
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+        if (pipWindow) {
+          // Render inside the native Document Picture-in-Picture window using top-level createPortal import
+          return createPortal(popupContent, pipWindow.document.body);
+        }
+
+        // Fallback for browsers that don't support Document PiP (e.g. Firefox)
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              left: `${minPopupPos.x}px`,
+              top: `${minPopupPos.y}px`,
+              zIndex: 9999,
+            }}
+            className={`w-72 bg-slate-950/95 backdrop-blur-md border border-indigo-500/40 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] overflow-hidden text-white transition-all duration-150 ${
+              minPopupDragging ? "opacity-90 scale-[0.98]" : "opacity-100"
+            }`}
+          >
+            {popupContent}
+          </div>
+        );
+      })()}
 
       {/* Session Settings & Control Room Modal */}
       {showSettingsModal && (
@@ -2432,70 +3649,6 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
               {/* Tab Content: Teacher Controls */}
               {isHost && activeSettingsTab === 'controls' && (
                 <div className="space-y-6">
-                  {/* Grid of two columns for controls */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                    {/* Attendance Controls */}
-                    <div className="bg-slate-950/40 p-4 border border-white/5 rounded-2xl space-y-3">
-                      <div className="flex items-center gap-1.5 text-slate-300 font-bold text-xs uppercase tracking-wider">
-                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
-                        Attendance Check-ins
-                      </div>
-                      <button
-                        onClick={async () => {
-                          const updatedState = !meetingState?.activeVerificationDisabled;
-                          await updateDoc(doc(db, "meetings", meeting.id), {
-                            activeVerificationDisabled: updatedState
-                          });
-                        }}
-                        className={`w-full py-2.5 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-between border cursor-pointer ${
-                          meetingState?.activeVerificationDisabled
-                            ? "bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20"
-                            : "bg-indigo-600/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-600/25"
-                        }`}
-                      >
-                        <span>{meetingState?.activeVerificationDisabled ? "● Popups Stopped" : "● Popups Running"}</span>
-                        <span className="text-[9.5px] uppercase font-mono px-1.5 py-0.5 rounded bg-slate-950 border border-white/5">
-                          {meetingState?.activeVerificationDisabled ? "Disabled" : "Active"}
-                        </span>
-                      </button>
-                      <p className="text-[10.5px] text-slate-400 leading-snug">
-                        {meetingState?.activeVerificationDisabled 
-                          ? "Attendance check-ins will not be prompted to cohort students."
-                          : "Students are periodically challenged with attention verify popups."}
-                      </p>
-                    </div>
-
-                    {/* Class Live Quizzes */}
-                    <div className="bg-slate-950/40 p-4 border border-white/5 rounded-2xl space-y-3">
-                      <div className="flex items-center gap-1.5 text-slate-300 font-bold text-xs uppercase tracking-wider">
-                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
-                        Milestone Quizzes
-                      </div>
-                      <button
-                        onClick={async () => {
-                          const updatedState = !meetingState?.liveQuizDisabled;
-                          await updateDoc(doc(db, "meetings", meeting.id), {
-                            liveQuizDisabled: updatedState
-                          });
-                        }}
-                        className={`w-full py-2.5 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-between border cursor-pointer ${
-                          meetingState?.liveQuizDisabled
-                            ? "bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20"
-                            : "bg-indigo-600/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-600/25"
-                        }`}
-                      >
-                        <span>{meetingState?.liveQuizDisabled ? "● Quizzes Stopped" : "● Quizzes Active"}</span>
-                        <span className="text-[9.5px] uppercase font-mono px-1.5 py-0.5 rounded bg-slate-950 border border-white/5">
-                          {meetingState?.liveQuizDisabled ? "Disabled" : "Active"}
-                        </span>
-                      </button>
-                      <p className="text-[10.5px] text-slate-400 leading-snug">
-                        {meetingState?.liveQuizDisabled 
-                          ? "Interactive and scheduled evaluation quizzes are temporarily paused."
-                          : "Quizzes will automatically pop up according to schedule intervals."}
-                      </p>
-                    </div>
-                  </div>
 
                   {/* AI Questioning Row */}
                   <div className="bg-slate-950/40 p-4 border border-white/5 rounded-2xl space-y-3">
@@ -2665,39 +3818,93 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                     </div>
                   )}
 
-                  {/* Demo clock multiplier toggle */}
-                  <div className="p-4 bg-slate-950/40 border border-white/5 rounded-2xl flex items-center justify-between text-xs">
-                    <div className="space-y-0.5 pr-4">
-                      <span className="text-slate-300 font-bold block flex items-center gap-1">
-                        <Clock className="w-3.5 h-3.5 text-indigo-400 animate-pulse" /> Demo Time-lapse Accelerator
-                      </span>
-                      <span className="text-[10.5px] text-slate-500 leading-snug block">
-                        Accelerate scheduled triggers and intervals for quick evaluation and review.
-                      </span>
+
+                  {/* 3 Toggle Buttons: Attendance / Discussion Quiz / Pre-generated Quiz */}
+                  <div className="mt-2 space-y-2 border-t border-white/5 pt-4">
+                    <span className="text-slate-300 font-bold text-xs uppercase tracking-wider flex items-center gap-2">
+                      Feature Toggles
+                    </span>
+
+                    {/* Toggle 1: Attendance */}
+                    <div className="flex items-center justify-between p-3.5 bg-slate-950/40 border border-white/5 rounded-xl">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                          <Bell className="w-4 h-4 text-indigo-400" />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold text-slate-200 block">Attendance Check-ins</span>
+                          <span className="text-[10px] text-slate-500">Random presence verification popups</span>
+                        </div>
+                      </div>
+                      <button
+                        onClick={isHost ? async () => {
+                          await updateDoc(doc(db, "meetings", meeting.id), {
+                            activeVerificationDisabled: !meetingState?.activeVerificationDisabled
+                          });
+                        } : undefined}
+                        className={`relative w-11 h-6 rounded-full border transition-all flex items-center ${isHost ? "cursor-pointer" : "cursor-not-allowed opacity-60"} ${
+                          !meetingState?.activeVerificationDisabled ? "bg-indigo-600 border-indigo-500/50 justify-end pr-1" : "bg-slate-800 border-white/10 justify-start pl-1"
+                        }`}
+                      >
+                        <span className="w-4 h-4 rounded-full bg-white shadow-sm block" />
+                      </button>
                     </div>
-                    <label className="relative inline-flex items-center cursor-pointer select-none flex-shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={demoMode}
-                        onChange={(e) => setDemoMode(e.target.checked)}
-                        className="w-4 h-4 rounded text-indigo-600 bg-slate-950 border-white/10 cursor-pointer"
-                      />
-                    </label>
+
+                    {/* Toggle 2: Discussion Quiz AI Live */}
+                    <div className="flex items-center justify-between p-3.5 bg-slate-950/40 border border-white/5 rounded-xl">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                          <Sparkles className="w-4 h-4 text-indigo-400" />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold text-slate-200 block">Discussion Quiz (AI Live)</span>
+                          <span className="text-[10px] text-slate-500">Auto-generated from live chat & discussion</span>
+                        </div>
+                      </div>
+                      <button
+                        onClick={isHost ? async () => {
+                          await updateDoc(doc(db, "meetings", meeting.id), {
+                            liveQuizGenerationEnabled: !meetingState?.liveQuizGenerationEnabled
+                          });
+                        } : undefined}
+                        className={`relative w-11 h-6 rounded-full border transition-all flex items-center ${isHost ? "cursor-pointer" : "cursor-not-allowed opacity-60"} ${
+                          meetingState?.liveQuizGenerationEnabled ? "bg-indigo-600 border-indigo-500/50 justify-end pr-1" : "bg-slate-800 border-white/10 justify-start pl-1"
+                        }`}
+                      >
+                        <span className="w-4 h-4 rounded-full bg-white shadow-sm block" />
+                      </button>
+                    </div>
+
+                    {/* Toggle 3: Pre-generated Quiz */}
+                    <div className="flex items-center justify-between p-3.5 bg-slate-950/40 border border-white/5 rounded-xl">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                          <HelpCircle className="w-4 h-4 text-indigo-400" />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold text-slate-200 block">Pre-generated Quiz</span>
+                          <span className="text-[10px] text-slate-500">Scheduled milestone evaluation quizzes</span>
+                        </div>
+                      </div>
+                      <button
+                        onClick={isHost ? async () => {
+                          await updateDoc(doc(db, "meetings", meeting.id), {
+                            liveQuizDisabled: !meetingState?.liveQuizDisabled
+                          });
+                        } : undefined}
+                        className={`relative w-11 h-6 rounded-full border transition-all flex items-center ${isHost ? "cursor-pointer" : "cursor-not-allowed opacity-60"} ${
+                          !meetingState?.liveQuizDisabled ? "bg-indigo-600 border-indigo-500/50 justify-end pr-1" : "bg-slate-800 border-white/10 justify-start pl-1"
+                        }`}
+                      >
+                        <span className="w-4 h-4 rounded-full bg-white shadow-sm block" />
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
 
             </div>
 
-            {/* Modal Footer */}
-            <div className="bg-slate-950/80 px-6 py-4 flex items-center justify-end border-t border-white/10">
-              <button
-                onClick={() => setShowSettingsModal(false)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl border border-white/5 cursor-pointer transition-all"
-              >
-                Dismiss
-              </button>
-            </div>
 
           </div>
         </div>

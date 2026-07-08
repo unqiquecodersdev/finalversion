@@ -30,7 +30,7 @@ export const Navbar: React.FC<NavbarProps> = ({ user, onLogout, activeTab, setAc
   };
 
   return (
-    <header className="border-b border-white/10 bg-black sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between text-slate-200 shadow-md">
+    <header className="border-b border-indigo-500/20 bg-gradient-to-r from-slate-950 via-slate-900 to-indigo-950 sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg shadow-indigo-900/10">
       {/* Left side: Logo only (clickable to return to classrooms) */}
       <button 
         onClick={() => setActiveTab("classrooms")}
