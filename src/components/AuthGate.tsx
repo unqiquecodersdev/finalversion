@@ -3,7 +3,7 @@ import {
   auth, db, createUserWithEmailAndPassword, signInWithEmailAndPassword, doc, setDoc, getDoc 
 } from "../firebase";
 import { UserProfile, UserRole } from "../types";
-import { BookOpen, User, Lock, Mail, Users, ArrowRight, ShieldCheck, HelpCircle } from "lucide-react";
+import { BookOpen, User, Lock, Mail, ArrowRight } from "lucide-react";
 
 interface AuthGateProps {
   onAuthenticated: (profile: UserProfile) => void;
@@ -52,12 +52,16 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
         if (userDoc.exists()) {
           onAuthenticated(userDoc.data() as UserProfile);
         } else {
+          // Determine role — admin email always gets admin role
+          const ADMIN_EMAIL = "ajnasim72@gmail.com";
+          const assignedRole: UserRole = email.toLowerCase() === ADMIN_EMAIL ? "admin" : "student";
+
           // If no doc exists (fallback), generate profile
           const profile: UserProfile = {
             uid: userUid,
             email,
             name: (credentials.user as any).displayName || email.split("@")[0],
-            role: "student",
+            role: assignedRole,
             createdAt: new Date().toISOString(),
           };
           await setDoc(doc(db, "users", userUid), profile);
@@ -80,107 +84,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
     }
   };
 
-  /**
-   * Helper sandbox login to make reviewing or immediate multi-person testing super comfortable
-   */
-  const handleSandboxLogin = async (selectedRole: UserRole, sandboxName: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      // Use standard credentials for Sandbox to login seamlessly without prompting forms
-      const sandboxEmail = `${selectedRole}_sandbox@edumeet.internal`;
-      const sandboxPassword = "eduMeetSuperSafe99!";
-
-      let firebaseUser: any = null;
-      try {
-        // Try logging in with Firebase Auth first
-        const credentials = await signInWithEmailAndPassword(auth, sandboxEmail, sandboxPassword);
-        firebaseUser = credentials.user;
-      } catch (signinErr: any) {
-        // If user credentials do not exist or are invalid, register a new sandbox user account
-        if (signinErr.code === "auth/user-not-found" || signinErr.code === "auth/invalid-credential" || signinErr.code === "auth/wrong-password") {
-          try {
-            const credentials = await createUserWithEmailAndPassword(auth, sandboxEmail, sandboxPassword);
-            firebaseUser = credentials.user;
-          } catch (createErr) {
-            console.warn("Failed creating sandbox user, trying to log in once more or propagating", createErr);
-            throw signinErr;
-          }
-        } else {
-          // Propagate network or other critical auth errors to trigger stable offline mode
-          throw signinErr;
-        }
-      }
-
-      if (firebaseUser) {
-        // IMPORTANT: always use the Firebase UID — this is what gets stored in classrooms as teacherId
-        const firebaseUid = firebaseUser.uid;
-
-        // Ensure the matching profile is placed and loaded from Firestore DB
-        let profile: UserProfile | null = null;
-        try {
-          const userDoc = await getDoc(doc(db, "users", firebaseUid));
-          if (userDoc && userDoc.exists()) {
-            profile = userDoc.data() as UserProfile;
-            // Ensure the stored profile UID matches the Firebase UID (repair stale docs)
-            if (profile.uid !== firebaseUid) {
-              profile = { ...profile, uid: firebaseUid };
-              await setDoc(doc(db, "users", firebaseUid), profile);
-            }
-          }
-        } catch (dbReadErr) {
-          console.warn("Failed reading Sandbox profile from Firestore, using client sync placeholder:", dbReadErr);
-        }
-
-        if (!profile) {
-          profile = {
-            uid: firebaseUid,
-            email: sandboxEmail,
-            name: sandboxName,
-            role: selectedRole,
-            createdAt: new Date().toISOString(),
-          };
-          try {
-            await setDoc(doc(db, "users", firebaseUid), profile);
-          } catch (dbWriteErr) {
-            console.warn("Could not save new user profile to Firestore database:", dbWriteErr);
-          }
-        }
-
-        // Cache the active profile to localStorage to enable instant offline refresh matching
-        localStorage.setItem("active_user_profile", JSON.stringify(profile));
-        onAuthenticated(profile);
-      }
-    } catch (err: any) {
-      console.warn("Firebase Sandbox auth failed or is offline. Activating stable role-based fallback:", err);
-      
-      // Generate a STABLE offline UID using a simple deterministic approach.
-      // We use the role + a fixed suffix so the same UID is always produced for the same role.
-      // This prevents UID mismatch when localStorage is cleared.
-      const sandboxEmail = `${selectedRole}_sandbox@edumeet.internal`;
-      // Simple deterministic hash from email string — no randomness
-      let hash = 0;
-      for (let i = 0; i < sandboxEmail.length; i++) {
-        hash = ((hash << 5) - hash) + sandboxEmail.charCodeAt(i);
-        hash |= 0;
-      }
-      const deterministicOfflineUid = `offline_${selectedRole}_${Math.abs(hash).toString(16)}`;
-
-      const offlineProfile: UserProfile = {
-        uid: deterministicOfflineUid,
-        email: sandboxEmail,
-        name: sandboxName + " (Offline Mode)",
-        role: selectedRole,
-        createdAt: new Date().toISOString()
-      };
-      
-      localStorage.setItem("active_user_profile", JSON.stringify(offlineProfile));
-      onAuthenticated(offlineProfile);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div className="min-h-screen flex flex-col justify-center items-center bg-slate-950 font-sans selection:bg-indigo-500/30 text-slate-200 p-6 md:p-12 relative overflow-hidden">
       {/* Background radial accent */}
@@ -192,146 +95,109 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
           <BookOpen className="w-5 h-5 text-indigo-400" />
         </div>
         <div>
-          <span className="font-extrabold text-base tracking-tight text-white block font-sans">EduClass Meet</span>
+          <span className="font-extrabold text-base tracking-tight text-white block font-sans">BetterClass</span>
           <span className="text-[10px] font-mono uppercase tracking-widest text-indigo-400 block">Interactive Classroom</span>
         </div>
       </div>
 
-        
-        {/* Interactive Classroom Sandbox Quick Access Toggles */}
-        <div className="w-full max-w-md bg-slate-900 border border-white/5 rounded-2xl p-6 shadow-2xl mb-8">
-          <div className="flex items-center gap-2 mb-4">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <h2 className="text-xs font-bold text-slate-200 tracking-wider uppercase">Sandbox Quick Access (Highly Recommended)</h2>
-          </div>
-          <p className="text-xs text-slate-400 leading-relaxed mb-4">
-            Skip writing register credentials by simulating a verified Sandbox profile immediately to test both perspectives simultaneously!
+      <div className="w-full max-w-md">
+        <div className="text-center mb-8">
+          <h2 className="text-2xl font-extrabold text-slate-100 tracking-tight font-sans">
+            {isSignUp ? "Create Account" : "Welcome Back"}
+          </h2>
+          <p className="text-xs text-slate-400 mt-2">
+            {isSignUp ? "Sign up to join your classroom" : "Log in to access your classroom"}
           </p>
-
-          <div className="grid grid-cols-3 gap-2">
-            <button
-              onClick={() => handleSandboxLogin("teacher", "Dr. Sarah Jenkins")}
-              className="py-2.5 px-2 bg-gradient-to-b from-indigo-900/30 to-indigo-950/40 hover:from-indigo-900/50 hover:to-indigo-950/60 text-indigo-300 font-semibold text-[11px] rounded-xl border border-indigo-500/20 text-center transition-all flex flex-col items-center gap-1.5 cursor-pointer shadow-[0_4px_12px_rgba(79,70,229,0.1)]"
-            >
-              <Users className="w-4 h-4 text-indigo-400" />
-              <span>Dr. Sarah (Teacher)</span>
-            </button>
-            <button
-              onClick={() => handleSandboxLogin("student", "Liam Thompson")}
-              className="py-2.5 px-2 bg-gradient-to-b from-emerald-900/30 to-emerald-950/40 hover:from-emerald-900/50 hover:to-emerald-950/60 text-emerald-300 font-semibold text-[11px] rounded-xl border border-emerald-500/20 text-center transition-all flex flex-col items-center gap-1.5 cursor-pointer shadow-[0_4px_12px_rgba(16,185,129,0.1)]"
-            >
-              <User className="w-4 h-4 text-emerald-400" />
-              <span>Liam (Student)</span>
-            </button>
-            <button
-              onClick={() => handleSandboxLogin("admin", "Admin Registrar")}
-              className="py-2.5 px-2 bg-gradient-to-b from-rose-900/30 to-rose-950/40 hover:from-rose-900/50 hover:to-rose-950/60 text-rose-300 font-semibold text-[11px] rounded-xl border border-rose-500/20 text-center transition-all flex flex-col items-center gap-1.5 cursor-pointer shadow-[0_4px_12px_rgba(244,63,94,0.1)]"
-            >
-              <Lock className="w-4 h-4 text-rose-450" />
-              <span>Edu Admin</span>
-            </button>
-          </div>
         </div>
 
-        <div className="w-full max-w-md">
-          <div className="text-center mb-8">
-            <h2 className="text-2xl font-extrabold text-slate-100 tracking-tight font-sans">
-              {isSignUp ? "Create Virtual Account" : "Access Classroom Hub"}
-            </h2>
-            <p className="text-xs text-slate-400 mt-2">
-              {isSignUp ? "Establish standard user status to register classroom links" : "Log in to join your teacher's scheduled meetings"}
-            </p>
-          </div>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {error && (
+            <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-305 text-xs font-semibold rounded-xl">
+              {error}
+            </div>
+          )}
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {error && (
-              <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-305 text-xs font-semibold rounded-xl">
-                {error}
-              </div>
-            )}
-
-            {isSignUp && (
-              <div>
-                <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Full Name</label>
-                <div className="relative">
-                  <User className="absolute left-3 top-2.5 w-4 h-4 text-indigo-400/70" />
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g., Prof. Carter"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    className="w-full pl-9 pr-4 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100 placeholder:text-slate-500"
-                  />
-                </div>
-              </div>
-            )}
-
+          {isSignUp && (
             <div>
-              <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Email Address</label>
+              <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Full Name</label>
               <div className="relative">
-                <Mail className="absolute left-3 top-2.5 w-4 h-4 text-indigo-400/70" />
+                <User className="absolute left-3 top-2.5 w-4 h-4 text-indigo-400/70" />
                 <input
-                  type="email"
+                  type="text"
                   required
-                  placeholder="e.g., student@institute.edu"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="e.g., Prof. Carter"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
                   className="w-full pl-9 pr-4 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100 placeholder:text-slate-500"
                 />
               </div>
             </div>
+          )}
 
-            <div>
-              <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Password</label>
-              <div className="relative">
-                <Lock className="absolute left-3 top-2.5 w-4 h-4 text-indigo-400/70" />
-                <input
-                  type="password"
-                  required
-                  placeholder="Min 6 characters"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full pl-9 pr-4 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100 placeholder:text-slate-500"
-                />
-              </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Email Address</label>
+            <div className="relative">
+              <Mail className="absolute left-3 top-2.5 w-4 h-4 text-indigo-400/70" />
+              <input
+                type="email"
+                required
+                placeholder="e.g., student@institute.edu"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="w-full pl-9 pr-4 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100 placeholder:text-slate-500"
+              />
             </div>
-
-            {isSignUp && (
-              <div>
-                <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Classroom Role</label>
-                <select
-                  value={role}
-                  onChange={(e) => setRole(e.target.value as UserRole)}
-                  className="w-full px-3 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100"
-                >
-                  <option value="student">Student (Joins Classroom Codes)</option>
-                  <option value="teacher">Teacher (Creates Groups, Hosts and Previews Quizzes)</option>
-                  <option value="admin">Super Admin (Institute Management)</option>
-                </select>
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-[0_0_20px_rgba(79,70,229,0.3)] hover:scale-[1.01] transition-all cursor-pointer flex items-center justify-center gap-2"
-            >
-              {loading ? "Authenticating Platform..." : isSignUp ? "Build Account" : "Access Terminal"}
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </form>
-
-          <div className="text-center mt-6">
-            <button
-              type="button"
-              onClick={() => setIsSignUp(!isSignUp)}
-              className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition-all"
-            >
-              {isSignUp ? "Already have an account? Log In" : "Need institutional access? Sign Up"}
-            </button>
           </div>
+
+          <div>
+            <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Password</label>
+            <div className="relative">
+              <Lock className="absolute left-3 top-2.5 w-4 h-4 text-indigo-400/70" />
+              <input
+                type="password"
+                required
+                placeholder="Min 6 characters"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full pl-9 pr-4 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100 placeholder:text-slate-500"
+              />
+            </div>
+          </div>
+
+          {isSignUp && (
+            <div>
+              <label className="block text-xs font-bold text-slate-350 uppercase tracking-widest mb-1.5">Classroom Role</label>
+              <select
+                value={role}
+                onChange={(e) => setRole(e.target.value as UserRole)}
+                className="w-full px-3 py-2 text-xs bg-slate-900 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-all text-slate-100"
+              >
+                <option value="student">Student (Joins Classroom Codes)</option>
+                <option value="teacher">Teacher (Creates Groups, Hosts and Previews Quizzes)</option>
+              </select>
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-[0_0_20px_rgba(79,70,229,0.3)] hover:scale-[1.01] transition-all cursor-pointer flex items-center justify-center gap-2"
+          >
+            {loading ? "Authenticating..." : isSignUp ? "Create Account" : "Login"}
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+        </form>
+
+        <div className="text-center mt-6">
+          <button
+            type="button"
+            onClick={() => setIsSignUp(!isSignUp)}
+            className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition-all"
+          >
+            {isSignUp ? "Already have an account? Log In" : "Don't have an account? Sign Up"}
+          </button>
         </div>
       </div>
-    );
+    </div>
+  );
 };
