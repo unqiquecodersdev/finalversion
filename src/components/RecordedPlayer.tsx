@@ -4,7 +4,7 @@ import { db, doc, getDoc, setDoc, updateDoc, collection, getDocs, onSnapshot } f
 import { 
   Play, Pause, RotateCcw, Award, Sparkles, CheckCircle, AlertCircle, ChevronRight, 
   HelpCircle, MonitorPlay, Clock, ListRestart, FileCheck, Minimize2, Maximize2,
-  Volume2, VolumeX, MessageSquare, Users
+  Volume2, VolumeX, MessageSquare, Users, Rewind, FastForward, Search
 } from "lucide-react";
 
 interface RecordedPlayerProps {
@@ -46,7 +46,10 @@ const getDirectVideoUrl = (url: string, title?: string, description?: string): s
 /** Returns true when the URL points to an actual recorded file (not a fallback sample) */
 const isActualRecording = (url?: string): boolean => {
   if (!url) return false;
-  return url.startsWith("/recordings/") || url.includes("drive.google.com");
+  if (url.includes("interactive-examples.mdn.mozilla.net") || url.includes("gtv-videos-bucket")) {
+    return false;
+  }
+  return true;
 };
 
 export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, onClose }) => {
@@ -118,65 +121,17 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
   // Milestones where quizzes are scheduled: e.g., 20%, 45%, 70%, 90% timeline
   const milestones = [15, 40, 65, 85];
 
-  // Floating Checkpoints Draggable Controls
-  const [chkDragOffset, setChkDragOffset] = useState({ x: 20, y: 16 });
-  const [chkIsDragging, setChkIsDragging] = useState(false);
-  const chkDragStartRef = useRef({ x: 0, y: 0 });
-  const chkElementStartRef = useRef({ x: 0, y: 0 });
-  const [chkMinimized, setChkMinimized] = useState(false);
-
-  const handleDragStart = (e: React.MouseEvent<HTMLDivElement>) => {
-    setChkIsDragging(true);
-    chkDragStartRef.current = { x: e.clientX, y: e.clientY };
-    chkElementStartRef.current = { x: chkDragOffset.x, y: chkDragOffset.y };
+  const handleBackward = () => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10);
+    }
   };
 
-  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
-    const touch = e.touches[0];
-    setChkIsDragging(true);
-    chkDragStartRef.current = { x: touch.clientX, y: touch.clientY };
-    chkElementStartRef.current = { x: chkDragOffset.x, y: chkDragOffset.y };
+  const handleForward = () => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = Math.min(videoRef.current.duration || 0, videoRef.current.currentTime + 10);
+    }
   };
-
-  useEffect(() => {
-    if (!chkIsDragging) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      const dx = e.clientX - chkDragStartRef.current.x;
-      const dy = e.clientY - chkDragStartRef.current.y;
-      setChkDragOffset({
-        x: chkElementStartRef.current.x - dx,
-        y: chkElementStartRef.current.y + dy
-      });
-    };
-
-    const handleTouchMove = (e: TouchEvent) => {
-      if (e.touches.length === 0) return;
-      const touch = e.touches[0];
-      const dx = touch.clientX - chkDragStartRef.current.x;
-      const dy = touch.clientY - chkDragStartRef.current.y;
-      setChkDragOffset({
-        x: chkElementStartRef.current.x - dx,
-        y: chkElementStartRef.current.y + dy
-      });
-    };
-
-    const handleMouseUp = () => {
-      setChkIsDragging(false);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-    window.addEventListener("touchmove", handleTouchMove, { passive: false });
-    window.addEventListener("touchend", handleMouseUp);
-
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-      window.removeEventListener("touchmove", handleTouchMove);
-      window.removeEventListener("touchend", handleMouseUp);
-    };
-  }, [chkIsDragging]);
 
   // 1. Fetch unique alternative quizzes from the full-stack server-side Gemini route
   const fetchAlternativeQuizzes = useCallback(async () => {
@@ -468,481 +423,346 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
   // Show chats proportionally as video progress increases
   const visibleCount = Math.max(0, Math.floor((progress / 100) * chatMessages.length));
   const visibleChats = chatMessages.slice(0, visibleCount);
-
   return (
     <>
     <div className="bg-slate-900 border border-white/5 rounded-[32px] p-6 md:p-8 shadow-2xl text-slate-200 relative overflow-hidden">
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+      {/* Main container taking full width */}
+      <div className="w-full space-y-6">
         
-        {/* Playback Stage column - 8 cols for theater mode sidebar */}
-        <div className="lg:col-span-8 space-y-4">
+        {/* Virtual Player Screen Mock */}
+        <div className="relative bg-slate-950 rounded-3xl aspect-video overflow-hidden flex flex-col justify-between p-6 border border-white/10 shadow-2xl w-full">
           
-          {/* Virtual Player Screen Mock */}
-          <div className="relative bg-slate-950 rounded-3xl aspect-video overflow-hidden flex flex-col justify-between p-6 border border-white/10 shadow-2xl">
-            
-            {/* The Real HTML5 Video element */}
-            <video
-              ref={videoRef}
-              src={getDirectVideoUrl(meeting.recordedVideoUrl || "", meeting.title, meeting.description)}
-              className={`w-full h-full rounded-3xl absolute inset-0 z-0 transition-opacity ${
-                isActualRecording(meeting.recordedVideoUrl) ? "object-contain opacity-100" : "object-cover opacity-75"
-              }`}
-              onTimeUpdate={handleTimeUpdate}
-              onEnded={() => {
-                setPlaying(false);
-                setReplayFinished(true);
-                calculateFinalRecordedGrade(answers);
-              }}
-              playsInline
-              muted={muted}
-            />
+          {/* The Real HTML5 Video element */}
+          <video
+            ref={videoRef}
+            src={getDirectVideoUrl(meeting.recordedVideoUrl || "", meeting.title, meeting.description)}
+            className={`w-full h-full rounded-3xl absolute inset-0 z-0 transition-opacity ${
+              isActualRecording(meeting.recordedVideoUrl) ? "object-contain opacity-100" : "object-cover opacity-75"
+            }`}
+            onTimeUpdate={handleTimeUpdate}
+            onEnded={() => {
+              setPlaying(false);
+              setReplayFinished(true);
+              calculateFinalRecordedGrade(answers);
+            }}
+            playsInline
+            muted={muted}
+          />
 
-            {/* Dark blur overlay during pause or milestone quiz */}
-            <div className={`absolute inset-0 bg-slate-950/60 backdrop-blur-[1.5px] transition-all duration-300 z-5 pointer-events-none ${
-              !playing ? "opacity-100" : "opacity-0"
-            }`} />
+          {/* Dark blur overlay during pause or milestone quiz */}
+          <div className={`absolute inset-0 bg-slate-950/60 backdrop-blur-[1.5px] transition-all duration-300 z-5 pointer-events-none ${
+            !playing ? "opacity-100" : "opacity-0"
+          }`} />
 
-            {/* Live Captioning subtitle overlay */}
-            {playing && !currentQuiz && (
-              <div className="absolute bottom-24 left-6 right-6 z-10 flex justify-center pointer-events-none">
-                <div className="bg-slate-950/85 backdrop-blur-md px-4 py-2 border border-indigo-500/30 text-indigo-200 text-[11px] font-sans rounded-xl max-w-lg text-center leading-normal shadow-2xl scale-in-animation">
-                  <span className="text-[9px] uppercase font-mono tracking-widest text-indigo-400 block font-bold mb-0.5 animate-pulse">Live Subtitles</span>
-                  "{getLiveCaption(progress)}"
+          {/* Live Captioning subtitle overlay */}
+          {playing && !currentQuiz && (
+            <div className="absolute bottom-24 left-6 right-6 z-10 flex justify-center pointer-events-none">
+              <div className="bg-slate-950/85 backdrop-blur-md px-4 py-2 border border-indigo-500/30 text-indigo-200 text-[11px] font-sans rounded-xl max-w-lg text-center leading-normal shadow-2xl scale-in-animation">
+                <span className="text-[9px] uppercase font-mono tracking-widest text-indigo-400 block font-bold mb-0.5 animate-pulse">Live Subtitles</span>
+                "{getLiveCaption(progress)}"
+              </div>
+            </div>
+          )}
+
+          {/* Stage header info */}
+          <div className="flex items-center justify-between z-10">
+            <div className={`px-3 py-1 backdrop-blur-md font-mono text-[10px] uppercase tracking-wider rounded-lg flex items-center gap-1.5 font-bold border ${
+              isActualRecording(meeting.recordedVideoUrl)
+                ? "bg-emerald-950/90 border-emerald-800/60 text-emerald-300"
+                : "bg-indigo-950/85 border-indigo-900/50 text-indigo-300"
+            }`}>
+              <Clock className="w-3.5 h-3.5 animate-pulse" />
+              <span>{isActualRecording(meeting.recordedVideoUrl) ? "Live Class Recording" : "Demo Replay Mode"}</span>
+            </div>
+
+            <button
+              onClick={onClose}
+              className="px-3 py-1 bg-rose-955/90 hover:bg-rose-900 border border-rose-500/30 text-rose-350 cursor-pointer rounded-lg text-xs font-bold font-mono uppercase tracking-wider transition-all"
+            >
+              Exit Replay
+            </button>
+          </div>
+
+          {/* Stage core presentation overlay graphics */}
+          <div className="my-auto text-center flex flex-col items-center justify-center p-4 z-10">
+            {replayFinished ? (
+              <div className="scale-in-animation p-4 bg-slate-900/85 backdrop-blur-md rounded-2xl border border-white/5 shadow-xl max-w-sm">
+                <div className="w-12 h-12 rounded-xl bg-indigo-505/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-3 mx-auto">
+                  <Award className="w-6 h-6 text-indigo-400 animate-pulse" />
                 </div>
+                <h4 className="text-md font-bold text-indigo-400">Class Broadcast Complete!</h4>
+                <p className="text-xs text-slate-300 mt-1 max-w-xs mx-auto leading-relaxed">
+                  All timeline checking quizzes successfully resolved. Your grading metrics were recorded securely.
+                </p>
               </div>
-            )}
-
-            {/* Stage header info */}
-            <div className="flex items-center justify-between z-10">
-              <div className={`px-3 py-1 backdrop-blur-md font-mono text-[10px] uppercase tracking-wider rounded-lg flex items-center gap-1.5 font-bold border ${
-                isActualRecording(meeting.recordedVideoUrl)
-                  ? "bg-emerald-950/90 border-emerald-800/60 text-emerald-300"
-                  : "bg-indigo-950/85 border-indigo-900/50 text-indigo-300"
-              }`}>
-                <Clock className="w-3.5 h-3.5 animate-pulse" />
-                <span>{isActualRecording(meeting.recordedVideoUrl) ? "Live Class Recording" : "Demo Replay Mode"}</span>
+            ) : currentQuiz ? (
+              <div className="scale-in-animation p-4 bg-amber-500/5 backdrop-blur-sm rounded-2xl border border-amber-500/10 shadow-xl max-w-xs">
+                <h4 className="text-xs font-semibold text-amber-400 tracking-tight animate-pulse uppercase">Timeline Evaluation Active</h4>
+                <p className="text-[11px] text-slate-300 mt-1 leading-relaxed">
+                  Study video currently locked. Submit your response to the interactive checkpoint quiz below to resume.
+                </p>
               </div>
+            ) : !playing ? (
+              <div className="scale-in-animation p-4 bg-slate-900/80 backdrop-blur-md rounded-2xl border border-white/5 shadow-xl max-w-xs">
+                <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-2 mx-auto">
+                  <MonitorPlay className="w-5 h-5" />
+                </div>
+                <p className="text-zinc-200 font-bold text-xs truncate max-w-xs">{meeting.classroomName}</p>
+                <p className="text-[10px] text-slate-450 mt-1 font-mono tracking-wider font-bold uppercase">Lesson Recording Paused</p>
+              </div>
+            ) : null}
+          </div>
 
+          {/* Video Controls shelf */}
+          <div className="space-y-4 z-10 w-full bg-slate-950/85 backdrop-blur-sm p-3.5 rounded-2xl border border-white/10 shadow-inner">
+            {/* Timeline bar */}
+            <div className="space-y-1.5">
+              <div 
+                className="h-2.5 bg-slate-900/90 rounded-full cursor-pointer relative border border-white/10 group overflow-hidden"
+                onClick={handleSeek}
+                title="Click anywhere to seek video segments"
+              >
+                <div 
+                  className="h-full bg-indigo-500 rounded-full transition-all group-hover:bg-indigo-400"
+                  style={{ width: `${progress}%` }}
+                />
+                {milestones.map((m, idx) => (
+                  <div 
+                    key={idx}
+                    className={`absolute top-0 bottom-0 w-1 ${idx <= quizTriggerIndex ? "bg-amber-450" : "bg-slate-705"}`}
+                    style={{ left: `${m}%` }}
+                    title={`Quiz Checkpoint ${idx + 1}`}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Action grid */}
+            <div className="flex items-center justify-between border-t border-white/5 pt-2.5">
               <div className="flex items-center gap-3">
-                <div className="px-3 py-1 bg-slate-900/85 backdrop-blur-sm rounded-lg border border-white/10 text-[11px] font-mono text-slate-350">
-                  Speed: {speed}x
-                </div>
+                {/* Skip Backward 10s */}
                 <button
-                  onClick={onClose}
-                  className="px-3 py-1 bg-rose-950/90 hover:bg-rose-900 border border-rose-500/30 text-rose-350 cursor-pointer rounded-lg text-xs font-bold font-mono uppercase tracking-wider transition-all"
+                  onClick={() => { if(videoRef.current) videoRef.current.currentTime -= 10 }}
+                  className="p-2.5 bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all cursor-pointer"
+                  title="Skip backward 10s"
                 >
-                  Exit Replay
+                  <Rewind className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Play/Pause */}
+                <button
+                  disabled={replayFinished || currentQuiz !== null}
+                  onClick={() => setPlaying(!playing)}
+                  className="p-2.5 bg-indigo-600 hover:bg-indigo-500 hover:scale-105 active:scale-95 text-white rounded-full shadow-2xl transition-all cursor-pointer disabled:opacity-30"
+                >
+                  {playing ? <Pause className="w-4 h-4 fill-white text-white" /> : <Play className="w-4 h-4 fill-white text-white translate-x-[1px]" />}
+                </button>
+
+                {/* Skip Forward 10s */}
+                <button
+                  onClick={() => { if(videoRef.current) videoRef.current.currentTime += 10 }}
+                  className="p-2.5 bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all cursor-pointer"
+                  title="Skip forward 10s"
+                >
+                  <FastForward className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Restart */}
+                <button
+                  onClick={resetLessonReplay}
+                  className="p-2.5 bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all cursor-pointer hover:rotate-45"
+                  title="Restart Lesson playback"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Volume audio controls */}
+                <button
+                  onClick={() => setMuted(!muted)}
+                  className="p-2.5 bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all cursor-pointer"
+                  title={muted ? "Unmute sound" : "Mute sound"}
+                >
+                  {muted ? <VolumeX className="w-3.5 h-3.5 text-rose-450" /> : <Volume2 className="w-3.5 h-3.5 text-indigo-400" />}
                 </button>
               </div>
             </div>
-
-            {/* Stage core presentation overlay graphics */}
-            <div className="my-auto text-center flex flex-col items-center justify-center p-4 z-10">
-              {replayFinished ? (
-                <div className="scale-in-animation p-4 bg-slate-900/85 backdrop-blur-md rounded-2xl border border-white/5 shadow-xl max-w-sm">
-                  <div className="w-12 h-12 rounded-xl bg-indigo-505/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-3 mx-auto">
-                    <Award className="w-6 h-6 text-indigo-400" />
-                  </div>
-                  <h4 className="text-md font-bold text-indigo-400">Class Broadcast Complete!</h4>
-                  <p className="text-xs text-slate-300 mt-1 max-w-xs mx-auto leading-relaxed">
-                    All timeline checking quizzes successfully resolved. Your grading metrics were recorded securely.
-                  </p>
-                </div>
-              ) : currentQuiz ? (
-                <div className="scale-in-animation p-4 bg-amber-500/5 backdrop-blur-sm rounded-2xl border border-amber-500/10 shadow-xl max-w-xs">
-                  <h4 className="text-xs font-semibold text-amber-400 tracking-tight animate-pulse uppercase">Timeline Evaluation Active</h4>
-                  <p className="text-[11px] text-slate-300 mt-1 leading-relaxed">
-                    Study video currently locked. Submit your response to the interactive checkpoint quiz below to resume.
-                  </p>
-                </div>
-              ) : !playing ? (
-                <div className="scale-in-animation p-4 bg-slate-900/80 backdrop-blur-md rounded-2xl border border-white/5 shadow-xl max-w-xs">
-                  <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-2 mx-auto">
-                    <MonitorPlay className="w-5 h-5" />
-                  </div>
-                  <p className="text-zinc-200 font-bold text-xs truncate max-w-xs">{meeting.classroomName}</p>
-                  <p className="text-[10px] text-slate-450 mt-1 font-mono tracking-wider font-bold uppercase">Lesson Recording Paused</p>
-                </div>
-              ) : null}
-            </div>
-
-            {/* Video Controls shelf */}
-            <div className="space-y-4 z-10 w-full bg-slate-950/85 backdrop-blur-sm p-3.5 rounded-2xl border border-white/10 shadow-inner">
-              {/* Timeline bar */}
-              <div className="space-y-1.5">
-                <div className="flex text-[10px] text-slate-400 font-mono justify-between">
-                  <span>Progress: {Math.round(progress)}%</span>
-                  <span>Timeline Checkpoints: {milestones.map(m => m + "%").join(", ")}</span>
-                </div>
-                <div 
-                  className="h-2.5 bg-slate-900/90 rounded-full cursor-pointer relative border border-white/10 group overflow-hidden"
-                  onClick={handleSeek}
-                  title="Click anywhere to seek video segments"
-                >
-                  <div 
-                    className="h-full bg-indigo-500 rounded-full transition-all group-hover:bg-indigo-400"
-                    style={{ width: `${progress}%` }}
-                  />
-                  {milestones.map((m, idx) => (
-                    <div 
-                      key={idx}
-                      className={`absolute top-0 bottom-0 w-1 ${idx <= quizTriggerIndex ? "bg-amber-450" : "bg-slate-705"}`}
-                      style={{ left: `${m}%` }}
-                      title={`Quiz Checkpoint ${idx + 1}`}
-                    />
-                  ))}
-                </div>
-              </div>
-
-              {/* Action grid */}
-              <div className="flex items-center justify-between border-t border-white/5 pt-2.5">
-                <div className="flex items-center gap-3">
-                  <button
-                    disabled={replayFinished || currentQuiz !== null}
-                    onClick={() => setPlaying(!playing)}
-                    className="p-2.5 bg-indigo-600 hover:bg-indigo-500 hover:scale-105 active:scale-95 text-white rounded-full shadow-2xl transition-all cursor-pointer disabled:opacity-30"
-                  >
-                    {playing ? <Pause className="w-4 h-4 fill-white text-white" /> : <Play className="w-4 h-4 fill-white text-white translate-x-[1px]" />}
-                  </button>
-
-                  <button
-                    onClick={resetLessonReplay}
-                    className="p-2.5 bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all cursor-pointer hover:rotate-45"
-                    title="Restart Lesson playback"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                  </button>
-
-                  {/* Volume audio controls */}
-                  <button
-                    onClick={() => setMuted(!muted)}
-                    className="p-2.5 bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all cursor-pointer"
-                    title={muted ? "Unmute broadcast sound" : "Mute broadcast sound"}
-                  >
-                    {muted ? <VolumeX className="w-3.5 h-3.5 text-rose-450" /> : <Volume2 className="w-3.5 h-3.5 text-indigo-400" />}
-                  </button>
-                </div>
-
-                <div className="flex gap-1.5">
-                  {[1, 1.5, 2, 4].map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => setSpeed(s)}
-                      className={`px-2.5 py-1 text-[10.5px] font-bold rounded-lg font-mono tracking-tight transition-all cursor-pointer ${
-                        speed === s 
-                          ? "bg-indigo-600 text-white shadow-xl" 
-                          : "bg-slate-900 border border-white/5 text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      {s}x Speed
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-
           </div>
 
         </div>
 
-        {/* Interactive Recorded Chat and Cohort Sidebar - 4 cols */}
-        <div className="lg:col-span-4 space-y-5 h-full flex flex-col justify-between">
-          {/* Chat Playback Feed */}
-          <div className="bg-slate-950/85 border border-white/10 rounded-3xl p-5 shadow-2xl flex-1 flex flex-col min-h-[350px]">
-            <div className="flex items-center justify-between border-b border-white/5 pb-3 mb-4">
-              <div className="flex items-center gap-2">
-                <MessageSquare className="w-4 h-4 text-indigo-400" />
-                <h4 className="text-xs font-bold uppercase tracking-wider font-sans text-slate-100">Class Chat Playback</h4>
-              </div>
-              <span className="text-[10px] bg-indigo-500/10 text-indigo-300 px-2 py-0.5 rounded font-mono font-bold">
-                {visibleChats.length} / {chatMessages.length} msgs
-              </span>
-            </div>
-
-            {/* Scrollable chat log */}
-            <div className="flex-1 overflow-y-auto space-y-3.5 max-h-[280px] pr-1 scrollbar-thin scrollbar-thumb-slate-800">
-              {visibleChats.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-center p-4">
-                  <p className="text-[11px] text-slate-500 italic">No chat messages yet. Press Play to start class discussion simulation.</p>
-                </div>
-              ) : (
-                visibleChats.map((c, idx) => {
-                  const isTeacher = c.senderRole === "teacher" || c.senderRole === "host" || c.senderRole === "assistant";
-                  return (
-                    <div key={idx} className="space-y-1 scale-in-animation">
-                      <div className="flex items-center gap-1.5">
-                        <span className={`text-[11px] font-bold ${isTeacher ? "text-indigo-400" : "text-slate-300"}`}>
-                          {c.senderName}
-                        </span>
-                        <span className={`text-[9px] uppercase tracking-wider font-mono px-1 py-0.2 rounded font-bold ${
-                          isTeacher ? "bg-indigo-500/10 text-indigo-300 border border-indigo-500/20" : "bg-slate-900 text-slate-400 border border-white/5"
-                        }`}>
-                          {c.senderRole || "student"}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-300 bg-slate-900/50 p-2 rounded-xl border border-white/5 leading-relaxed break-words">
-                        {c.message}
-                      </p>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-            <div className="text-[9.5px] text-slate-500 text-center border-t border-white/5 pt-2.5 mt-2.5 font-mono">
-              ★ Chat messages are synchronized with video progress
-            </div>
-          </div>
-
-          {/* Present cohort list */}
-          <div className="bg-slate-950/85 border border-white/10 rounded-3xl p-5 shadow-2xl">
-            <div className="flex items-center gap-2 border-b border-white/5 pb-3 mb-4">
-              <Users className="w-4 h-4 text-indigo-400" />
-              <h4 className="text-xs font-bold uppercase tracking-wider font-sans text-slate-100">Live Attendees Cohort</h4>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2.5">
-              <div className="flex items-center gap-2 p-2 bg-indigo-500/5 rounded-xl border border-indigo-500/10">
-                <div className="w-7 h-7 bg-indigo-600 text-white rounded-full flex items-center justify-center text-[10px] font-bold">
-                  {meeting.hostName?.charAt(0) || "T"}
-                </div>
-                <div className="min-w-0">
-                  <span className="text-[11px] font-bold text-slate-200 block truncate">{meeting.hostName || "Dr. Carter"}</span>
-                  <span className="text-[9px] text-indigo-300 block font-mono">Lecturer / Host</span>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 p-2 bg-slate-900/40 rounded-xl border border-white/5">
-                <div className="w-7 h-7 bg-teal-600 text-white rounded-full flex items-center justify-center text-[10px] font-bold">
-                  S
-                </div>
-                <div className="min-w-0">
-                  <span className="text-[11px] font-bold text-slate-200 block truncate">Sarah Jenkins</span>
-                  <span className="text-[9px] text-slate-500 block font-mono">100% check-ins</span>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 p-2 bg-slate-900/40 rounded-xl border border-white/5">
-                <div className="w-7 h-7 bg-sky-600 text-white rounded-full flex items-center justify-center text-[10px] font-bold">
-                  L
-                </div>
-                <div className="min-w-0">
-                  <span className="text-[11px] font-bold text-slate-200 block truncate">Liam O'Connor</span>
-                  <span className="text-[9px] text-slate-500 block font-mono">3/3 Quizzes pass</span>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 p-2 bg-slate-900/40 rounded-xl border border-white/5">
-                <div className="w-7 h-7 bg-amber-600 text-white rounded-full flex items-center justify-center text-[10px] font-bold">
-                  E
-                </div>
-                <div className="min-w-0">
-                  <span className="text-[11px] font-bold text-slate-200 block truncate">Elena Rostova</span>
-                  <span className="text-[9px] text-slate-500 block font-mono">Verified Active</span>
-                </div>
+        {/* Dynamic Replay Performance and Cohort Block */}
+        <div className="bg-slate-950/85 border border-white/10 rounded-3xl p-6 shadow-2xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-white/5 pb-4 mb-5 gap-3">
+            <div className="flex items-center gap-2">
+              <Users className="w-5 h-5 text-indigo-400" />
+              <div>
+                <h4 className="text-sm font-bold uppercase tracking-wider font-sans text-slate-100">
+                  {isTeacher ? "Live Attendees Cohort & Replay Performance" : "My Lesson Replay & Checkpoints"}
+                </h4>
+                <p className="text-[11px] text-slate-450 mt-0.5">
+                  {isTeacher 
+                    ? "Real-time verification of student live participation & recorded replay metrics." 
+                    : "Answer all scheduled check-in quizzes to verify active study and record your score."}
+                </p>
               </div>
             </div>
-          </div>
-        </div>
-
-      </div>
-
-      {/* Floating Draggable & Minimizable Checkpoints Progress / Teacher Performance Tracker */}
-      <div 
-        style={{
-          position: 'fixed',
-          right: `${chkDragOffset.x}px`,
-          top: `${chkDragOffset.y}px`,
-          zIndex: 43
-        }}
-        className={`bg-slate-900/95 backdrop-blur-md border border-white/10 rounded-2xl w-72 shadow-2xl overflow-hidden transition-all duration-150 ${
-          chkIsDragging ? "opacity-90 scale-[0.98]" : "opacity-100"
-        }`}
-      >
-        {/* Header Drag Handle */}
-        <div 
-          onMouseDown={handleDragStart}
-          onTouchStart={handleTouchStart}
-          className="bg-indigo-950/95 p-3 flex items-center justify-between border-b border-white/10 cursor-grab active:cursor-grabbing text-xs text-white"
-        >
-          <div className="flex items-center gap-2 font-bold uppercase tracking-wider select-none pointer-events-none font-sans">
-            {isTeacher ? (
-              <>
-                <Users className="w-4 h-4 text-indigo-400" />
-                <span>Class Replay Performance</span>
-              </>
-            ) : (
-              <>
-                <FileCheck className="w-4 h-4 text-indigo-400" />
-                <span>Progress Checkpoints</span>
-              </>
+            {isTeacher && (
+              <div className="relative w-full sm:w-64">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search enrolled students..."
+                  className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-900 border border-white/10 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-sans"
+                />
+                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              </div>
             )}
           </div>
-          <button 
-            onClick={(e) => {
-              e.stopPropagation();
-              setChkMinimized(!chkMinimized);
-            }}
-            className="p-1 hover:bg-white/10 rounded text-slate-400 hover:text-white transition-all cursor-pointer"
-            title={chkMinimized ? "Expand trackers" : "Minimize trackers"}
-          >
-            {chkMinimized ? <Maximize2 className="w-3.5 h-3.5" /> : <Minimize2 className="w-3.5 h-3.5" />}
-          </button>
-        </div>
 
-        {/* Checklist Body (only if not minimized) */}
-        {!chkMinimized && (
-          <div className="p-3.5 space-y-2.5 max-h-72 overflow-y-auto font-sans">
-            {isTeacher ? (
-              <div className="space-y-3">
-                {/* Search Bar */}
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search enrolled students..."
-                    className="w-full px-3 py-1.5 text-[11px] bg-slate-950 border border-white/10 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
-                  />
-                </div>
+          {isTeacher ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {studentUsers
+                .filter((u) => u.name.toLowerCase().includes(searchQuery.toLowerCase()))
+                .map((student) => {
+                  const response = meetingResponses.find((r) => r.userId === student.uid);
+                  const hasJoined = !!response;
+                  const score = response ? response.overallPercentage : 0;
+                  const isLive = response ? !response.missedLive : false;
 
-                {/* Student list */}
-                <div className="space-y-2 max-h-52 overflow-y-auto pr-0.5">
-                  {studentUsers
-                    .filter((u) => u.name.toLowerCase().includes(searchQuery.toLowerCase()))
-                    .map((student) => {
-                      const response = meetingResponses.find((r) => r.userId === student.uid);
-                      const hasJoined = !!response;
-                      const score = response ? response.overallPercentage : 0;
-                      const isLive = response ? !response.missedLive : false;
+                  return (
+                    <div 
+                      key={student.uid}
+                      className={`p-3.5 rounded-2xl border text-xs transition-all flex flex-col gap-2.5 ${
+                        hasJoined 
+                          ? "border-emerald-500/25 bg-emerald-950/10 text-slate-100" 
+                          : "border-white/5 bg-slate-900/20 text-slate-400"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold truncate max-w-[150px]" title={student.name}>
+                          {student.name}
+                        </span>
+                        <span className={`text-[9px] px-2 py-0.5 rounded font-mono font-bold uppercase tracking-wider border ${
+                          hasJoined
+                            ? isLive
+                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                              : "bg-indigo-500/10 text-indigo-400 border-indigo-500/20"
+                            : "bg-slate-900 text-slate-500 border-white/5"
+                        }`}>
+                          {hasJoined ? (isLive ? "Live" : "Replay") : "Absent"}
+                        </span>
+                      </div>
 
-                      return (
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-slate-400 font-sans">Activity Score:</span>
+                        <span className={`font-mono font-bold ${hasJoined ? "text-emerald-400" : "text-slate-500"}`}>
+                          {score}%
+                        </span>
+                      </div>
+
+                      {/* Mini visual performance slider */}
+                      <div className="w-full bg-slate-900 rounded-full h-1.5 relative overflow-hidden">
                         <div 
-                          key={student.uid}
-                          className={`p-2.5 rounded-xl border text-[11px] transition-all flex flex-col gap-1.5 ${
-                            hasJoined 
-                              ? "border-emerald-500/20 bg-emerald-950/10 text-slate-100" 
-                              : "border-white/5 bg-slate-950/20 text-slate-400"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="font-bold truncate max-w-[130px]" title={student.name}>
-                              {student.name}
-                            </span>
-                            <span className={`text-[8px] px-1.5 py-0.5 rounded font-mono font-bold uppercase tracking-wider border ${
-                              hasJoined
-                                ? isLive
-                                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                                  : "bg-indigo-500/10 text-indigo-400 border-indigo-500/20"
-                                : "bg-slate-900 text-slate-500 border-white/5"
-                            }`}>
-                              {hasJoined ? (isLive ? "Live" : "Replay") : "Absent"}
-                            </span>
-                          </div>
-
-                          <div className="flex items-center justify-between text-[10px]">
-                            <span className="text-slate-400">Activity Score:</span>
-                            <span className={`font-mono font-bold ${hasJoined ? "text-emerald-400" : "text-slate-500"}`}>
-                              {score}%
-                            </span>
-                          </div>
-
-                          {/* Mini visual performance slider */}
-                          <div className="w-full bg-slate-950 rounded-full h-1 relative overflow-hidden">
-                            <div 
-                              className={`h-full rounded-full transition-all duration-500 ${
-                                score >= 80 
-                                  ? "bg-emerald-500" 
-                                  : score >= 50 
-                                    ? "bg-amber-500" 
-                                    : "bg-rose-500"
-                              }`} 
-                              style={{ width: `${score}%` }} 
-                            />
-                          </div>
-                        </div>
-                      );
-                    })}
-
-                  {studentUsers.length === 0 && (
-                    <p className="text-[10px] text-slate-500 text-center italic py-4">No enrolled student profiles found.</p>
-                  )}
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            score >= 80 
+                              ? "bg-emerald-500" 
+                              : score >= 50 
+                                ? "bg-amber-500" 
+                                : "bg-rose-500"
+                          }`} 
+                          style={{ width: `${score}%` }} 
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              {studentUsers.length === 0 && (
+                <div className="col-span-full py-8 text-center text-slate-500 italic text-xs">
+                  No enrolled student profiles found.
                 </div>
-              </div>
-            ) : (
-              <>
-                {loadingQuizzes ? (
-                  <div className="py-8 text-center text-xs text-slate-500 font-mono">
-                    <span className="animate-spin inline-block w-3.5 h-3.5 border-2 border-indigo-500 border-t-transparent rounded-full mr-1.5" />
-                    Querying Server-Side Gemini...
-                  </div>
-                ) : parsingError ? (
-                  <div className="p-2.5 bg-rose-500/10 border border-rose-500/20 rounded-xl text-[10px] text-rose-400 leading-relaxed font-mono">
-                    API offline. Sandbox checkpoints loaded successfully.
-                  </div>
-                ) : null}
+              )}
+            </div>
+          ) : (
+            // Student's View: Checkpoint quizzes + overall evaluation
+            <div className="space-y-4">
+              {loadingQuizzes && (
+                <div className="py-8 text-center text-xs text-slate-500 font-mono">
+                  <span className="animate-spin inline-block w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full mr-2" />
+                  Querying Server-Side Gemini...
+                </div>
+              )}
 
-                <div className="space-y-2">
-                  {quizzes.map((q, idx) => {
-                    const answer = answers.find(a => a.quizIndex === idx);
-                    const isCorrect = answer?.isCorrect;
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                {quizzes.map((q, idx) => {
+                  const answer = answers.find(a => a.quizIndex === idx);
+                  const isCorrect = answer?.isCorrect;
 
-                    return (
-                      <div 
-                        key={idx} 
-                        className={`p-2.5 rounded-xl border text-[11px] transition-all flex items-center justify-between ${
-                          idx === quizTriggerIndex && currentQuiz
-                            ? "border-indigo-500 bg-indigo-950/40 text-indigo-300 font-bold"
-                            : "border-white/5 bg-slate-955/40 text-slate-300"
-                        }`}
-                      >
-                        <div className="flex-1 min-w-0 pr-2">
-                          <span className="font-bold block text-[9.5px] uppercase font-mono tracking-widest text-slate-500 pb-0.5">
-                            Checkpoint {idx + 1}
-                          </span>
-                          <span className="font-medium truncate block" title={q.question}>{q.question}</span>
-                        </div>
+                  return (
+                    <div 
+                      key={idx} 
+                      className={`p-3.5 rounded-2xl border text-xs transition-all flex flex-col justify-between gap-3 ${
+                        idx === quizTriggerIndex && currentQuiz
+                          ? "border-indigo-500 bg-indigo-950/30 text-indigo-300 font-bold"
+                          : "border-white/5 bg-slate-900/30 text-slate-350"
+                      }`}
+                    >
+                      <div>
+                        <span className="font-extrabold block text-[9px] uppercase font-mono tracking-widest text-slate-500 pb-1">
+                          Checkpoint {idx + 1}
+                        </span>
+                        <span className="font-medium line-clamp-2 text-slate-200 font-sans" title={q.question}>{q.question}</span>
+                      </div>
 
-                        <div className="shrink-0">
+                      <div className="flex items-center justify-between border-t border-white/5 pt-2 mt-1">
+                        <span className="text-[10px] text-slate-550 font-mono">{q.category || "Evaluation"}</span>
+                        <div>
                           {idx > quizTriggerIndex ? (
-                            <span className="text-[8.5px] px-1.5 py-0.5 rounded bg-slate-900 border border-white/5 text-slate-600 font-mono font-bold uppercase">Locked</span>
+                            <span className="text-[9px] px-2 py-0.5 rounded bg-slate-900 border border-white/5 text-slate-600 font-mono font-bold uppercase font-sans">Locked</span>
                           ) : idx === quizTriggerIndex && currentQuiz ? (
-                            <span className="text-[8.5px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-bold uppercase font-mono tracking-wider animate-pulse">Solving</span>
+                            <span className="text-[9px] px-2 py-0.5 rounded bg-indigo-600 text-white font-bold uppercase font-mono tracking-wider animate-pulse font-sans">Solving</span>
                           ) : isCorrect ? (
-                            <span className="text-[8.5px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-bold uppercase font-mono tracking-wider border border-emerald-500/20">Correct</span>
+                            <span className="text-[9px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-bold uppercase font-mono tracking-wider border border-emerald-500/20 font-sans">Correct</span>
                           ) : (
-                            <span className="text-[8.5px] px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 font-bold uppercase font-mono tracking-wider border border-rose-500/20">Incorrect</span>
+                            <span className="text-[9px] px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 font-bold uppercase font-mono tracking-wider border border-rose-500/20 font-sans">Incorrect</span>
                           )}
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
-
-                {overallScore !== null && (
-                  <div className="pt-3 border-t border-white/5 text-center scale-in-animation space-y-2">
-                    <div>
-                      <span className="text-[10px] font-bold uppercase text-slate-400 tracking-wider font-mono">Final Replay Evaluation</span>
-                      <div className="text-3xl font-extrabold text-indigo-400 font-mono mt-1">
-                        {overallScore}%
-                      </div>
                     </div>
-                    <button
-                      onClick={() => {
-                        fetchAlternativeQuizzes();
-                        resetLessonReplay();
-                      }}
-                      className="w-full py-2 px-3 bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/30 text-white rounded-xl text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow"
-                    >
-                      <ListRestart className="w-3.5 h-3.5" />
-                      <span>Give Quizzes Again</span>
-                    </button>
+                  );
+                })}
+              </div>
+
+              {overallScore !== null && (
+                <div className="pt-4 mt-2 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+                      <Award className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <span className="text-[10px] font-bold uppercase text-slate-450 tracking-wider font-mono block">Final Replay Evaluation</span>
+                      <span className="text-xl font-extrabold text-indigo-400 font-mono">
+                        {overallScore}% Score
+                      </span>
+                    </div>
                   </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
+                  <button
+                    onClick={() => {
+                      fetchAlternativeQuizzes();
+                      resetLessonReplay();
+                    }}
+                    className="py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/30 text-white rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow font-sans"
+                  >
+                    <ListRestart className="w-3.5 h-3.5" />
+                    <span>Give Quizzes Again</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
       </div>
 
     </div>
@@ -968,7 +788,7 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
             </div>
           </div>
 
-          <h4 className="text-sm font-bold text-slate-100 leading-relaxed mb-6">
+          <h4 className="text-sm font-bold text-slate-100 leading-relaxed mb-6 font-sans">
             {currentQuiz.question}
           </h4>
 
@@ -981,7 +801,7 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
                   key={oIdx}
                   disabled={feedbackShown}
                   onClick={() => setSelectedOption(oIdx)}
-                  className={`w-full text-left p-4 rounded-2xl text-xs transition-all flex items-center justify-between border cursor-pointer font-medium ${
+                  className={`w-full text-left p-4 rounded-2xl text-xs transition-all flex items-center justify-between border cursor-pointer font-medium font-sans ${
                     feedbackShown
                       ? isCorrectAnswer
                         ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
@@ -1006,7 +826,7 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
           </div>
 
           {feedbackShown && (
-            <div className={`p-4 rounded-2xl mb-5 text-xs font-semibold flex items-start gap-2 ${
+            <div className={`p-4 rounded-2xl mb-5 text-xs font-semibold flex items-start gap-2 font-sans ${
               selectedOption === currentQuiz.correctAnswerIndex
                 ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-300"
                 : "bg-rose-500/10 border border-rose-500/20 text-rose-300"
@@ -1030,14 +850,14 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
               <button
                 onClick={submitQuizSelection}
                 disabled={selectedOption === null}
-                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold text-xs rounded-2xl shadow-lg shadow-indigo-600/20 transition-all cursor-pointer"
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold text-xs rounded-2xl shadow-lg shadow-indigo-600/20 transition-all cursor-pointer font-sans"
               >
                 Submit Answer
               </button>
             ) : (
               <button
                 onClick={handleNextLessonSegment}
-                className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-2xl shadow border border-white/10 transition-all cursor-pointer flex items-center justify-center gap-2"
+                className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-2xl shadow border border-white/10 transition-all cursor-pointer flex items-center justify-center gap-2 font-sans"
               >
                 <span>Resume Video</span>
                 <ChevronRight className="w-4 h-4 text-indigo-400" />

@@ -782,19 +782,15 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     };
   }, [tcIsDragging]);
 
-  // Document Picture-in-Picture logic
-  useEffect(() => {
-    if (!showMinimizedPopup) {
+  const togglePresenterTools = async () => {
+    if (showMinimizedPopup) {
       if (pipWindow) {
         pipWindow.close();
         setPipWindow(null);
       }
-      return;
-    }
-
-    let isSubscribed = true;
-
-    const openPiP = async () => {
+      setShowMinimizedPopup(false);
+    } else {
+      setShowMinimizedPopup(true);
       if ('documentPictureInPicture' in window) {
         try {
           // @ts-ignore
@@ -803,12 +799,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
             height: 480,
           });
 
-          if (!isSubscribed) {
-            pip.close();
-            return;
-          }
-
-          // Copy styles for Tailwind
+          // Copy styles for Tailwind/Styling
           [...document.styleSheets].forEach((styleSheet) => {
             try {
               const cssRules = [...styleSheet.cssRules].map((rule) => rule.cssText).join('');
@@ -831,7 +822,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
           fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap';
           pip.document.head.appendChild(fontLink);
 
-          pip.document.body.className = "bg-slate-950 font-sans antialiased text-slate-200 overflow-hidden";
+          pip.document.body.className = "bg-slate-955 font-sans antialiased text-slate-200 overflow-hidden";
 
           pip.addEventListener('pagehide', () => {
             setShowMinimizedPopup(false);
@@ -841,23 +832,18 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
           setPipWindow(pip);
         } catch (err) {
           console.warn("PiP failed to open", err);
-          // Browser blocking popup without user gesture
         }
       }
-    };
-
-    if (showMinimizedPopup && !pipWindow) {
-      openPiP();
     }
-    
+  };
+
+  useEffect(() => {
     return () => {
-      isSubscribed = false;
       if (pipWindow) {
         pipWindow.close();
-        setPipWindow(null);
       }
     };
-  }, [showMinimizedPopup]);
+  }, [pipWindow]);
 
   // Loading default meeting quizzes if empty
   useEffect(() => {
@@ -868,8 +854,14 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
   // Screen Sharing functions
   const startScreenShare = async () => {
-    if (meetingState?.screenShareBy) {
+    // If someone else is sharing, show alert
+    if (meetingState?.screenShareBy && meetingState.screenShareBy !== user.uid) {
       alert(`${meetingState.screenShareByName || "Someone"} is already sharing their screen.`);
+      return;
+    }
+    // If WE are already sharing (stale state from window switch), just stop
+    if (meetingState?.screenShareBy === user.uid) {
+      await stopScreenShare();
       return;
     }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
@@ -1132,7 +1124,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       ]);
 
       const supportedMime =
-        MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+        MediaRecorder.isTypeSupported("video/mp4;codecs=h264,aac")
+          ? "video/mp4;codecs=h264,aac"
+          : MediaRecorder.isTypeSupported("video/mp4")
+          ? "video/mp4"
+          : MediaRecorder.isTypeSupported("video/webm;codecs=h264,opus")
+          ? "video/webm;codecs=h264,opus"
+          : MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
           ? "video/webm;codecs=vp9,opus"
           : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
           ? "video/webm;codecs=vp8,opus"
@@ -1908,7 +1906,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
         try {
           const uploadRes = await fetch(`/api/upload-recording?meetingId=${meeting.id}`, {
             method: "POST",
-            headers: { "Content-Type": "video/webm" },
+            headers: { "Content-Type": mimeType },
             body: blob,
           });
 
@@ -2189,7 +2187,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                 {meetingState.screenShareBy === user.uid ? (
                   <video
                     ref={(el) => {
-                      if (el && screenStream) {
+                      if (el && screenStream && el.srcObject !== screenStream) {
                         el.srcObject = screenStream;
                       }
                     }}
@@ -2202,7 +2200,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                   <video
                     ref={(el) => {
                       const rStream = remoteScreenStreams[meetingState.screenShareBy!];
-                      if (el && rStream) {
+                      if (el && rStream && el.srcObject !== rStream) {
                         el.srcObject = rStream;
                       }
                     }}
@@ -2230,7 +2228,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                   {videoEnabled ? (
                     <video 
                       ref={(el) => {
-                        if (el && localStream) {
+                        if (el && localStream && el.srcObject !== localStream) {
                           el.srcObject = localStream;
                         }
                       }}
@@ -2290,7 +2288,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                     {videoEnabled ? (
                       <video 
                         ref={(el) => {
-                          if (el && localStream) {
+                          if (el && localStream && el.srcObject !== localStream) {
                             el.srcObject = localStream;
                           }
                         }}
@@ -2380,7 +2378,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                             {videoEnabled ? (
                               <video 
                                 ref={(el) => {
-                                  if (el && localStream) {
+                                  if (el && localStream && el.srcObject !== localStream) {
                                     el.srcObject = localStream;
                                   }
                                 }}
@@ -2411,7 +2409,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                         {videoEnabled ? (
                           <video 
                             ref={(el) => {
-                              if (el && localStream) {
+                              if (el && localStream && el.srcObject !== localStream) {
                                 el.srcObject = localStream;
                               }
                             }}
@@ -2494,7 +2492,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                             {videoEnabled ? (
                               <video 
                                 ref={(el) => {
-                                  if (el && localStream) {
+                                  if (el && localStream && el.srcObject !== localStream) {
                                     el.srcObject = localStream;
                                   }
                                 }}
@@ -2946,10 +2944,10 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
       </div>
 
       {/* Meet Bottom Action Control Bar */}
-      <div className="p-5 border-t border-white/10 bg-slate-900/90 backdrop-blur-md flex items-center justify-between z-20">
+      <div className="px-3 py-3 sm:p-5 border-t border-white/10 bg-slate-900/90 backdrop-blur-md flex items-center justify-between z-20 gap-2 sm:gap-0 overflow-x-auto">
         
         {/* Dynamic call metadata — clickable to open participants sidebar */}
-        <div className="flex items-center gap-3 bg-slate-950/40 px-3 py-1.5 rounded-2xl border border-white/5">
+        <div className="flex items-center gap-2 sm:gap-3 bg-slate-950/40 px-2 sm:px-3 py-1.5 rounded-2xl border border-white/5 flex-shrink-0">
           {/* Overlapping profile bubbles */}
           <div className="flex -space-x-2 mr-1">
             {/* Self bubble */}
@@ -3036,9 +3034,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
         </div>
 
         {/* Main calling interactors */}
-        <div className="flex items-center gap-3">
-          {/* Google Meet inspired View Switcher buttons */}
-          <div className="flex items-center bg-slate-950/60 rounded-full p-1 border border-white/5 gap-1 mr-1">
+        <div className="flex items-center gap-1.5 sm:gap-3 flex-shrink-0">
+          {/* Google Meet inspired View Switcher buttons — hidden on very small screens */}
+          <div className="hidden sm:flex items-center bg-slate-950/60 rounded-full p-1 border border-white/5 gap-1 mr-1">
             <button
               onClick={() => setMeetLayout('grid')}
               className={`p-2.5 rounded-full cursor-pointer transition-all ${
@@ -3076,7 +3074,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
           <button
             onClick={() => setMicEnabled(!micEnabled)}
-            className={`p-3.5 rounded-full border transition-all cursor-pointer ${
+            className={`p-2.5 sm:p-3.5 rounded-full border transition-all cursor-pointer ${
               micEnabled
                 ? "bg-slate-800 border-white/10 text-white hover:bg-slate-700"
                 : "bg-red-500/10 border-red-505/20 text-red-400 hover:bg-red-500/20"
@@ -3088,7 +3086,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
           <button
             onClick={() => setVideoEnabled(!videoEnabled)}
-            className={`p-3.5 rounded-full border transition-all cursor-pointer ${
+            className={`p-2.5 sm:p-3.5 rounded-full border transition-all cursor-pointer ${
               videoEnabled
                 ? "bg-slate-800 border-white/10 text-white hover:bg-slate-700"
                 : "bg-red-500/10 border-red-505/20 text-red-400 hover:bg-red-500/20"
@@ -3101,7 +3099,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
           {!isHost && (
             <button
               onClick={toggleHand}
-              className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
+              className={`p-2.5 sm:p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
                 handRaised ? "bg-amber-500/20 border-amber-500/50 text-amber-400" : "bg-slate-800 border-white/10 text-slate-300"
               }`}
               title={handRaised ? "Lower Hand" : "Raise Hand"}
@@ -3112,16 +3110,17 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
           <button
             onClick={() => {
-              if (screenStreamRef.current) {
+              // If either our local stream ref OR Firestore shows us as the sharer, stop
+              if (screenStreamRef.current || meetingState?.screenShareBy === user.uid) {
                 stopScreenShare();
               } else {
                 startScreenShare();
               }
             }}
-            className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
-              screenStream ? "bg-emerald-600/30 border-emerald-500/50 text-emerald-400 animate-pulse" : "bg-slate-800 border-white/10 text-slate-300"
+            className={`p-2.5 sm:p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
+              screenStream || meetingState?.screenShareBy === user.uid ? "bg-emerald-600/30 border-emerald-500/50 text-emerald-400 animate-pulse" : "bg-slate-800 border-white/10 text-slate-300"
             }`}
-            title={screenStream ? "Stop Sharing Screen" : "Share Screen"}
+            title={screenStream || meetingState?.screenShareBy === user.uid ? "Stop Sharing Screen" : "Share Screen"}
           >
             <Monitor className="w-4 h-4" />
           </button>
@@ -3129,8 +3128,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
           {/* Presenter Tools popup toggle — only while screen sharing is active */}
           {screenStream && (
             <button
-              onClick={() => setShowMinimizedPopup((prev) => !prev)}
-              className={`p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
+              onClick={togglePresenterTools}
+              className={`hidden sm:block p-2.5 sm:p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 ${
                 showMinimizedPopup
                   ? "bg-indigo-600/30 border-indigo-500/50 text-indigo-400"
                   : "bg-slate-800 border-white/10 text-slate-300"
@@ -3148,7 +3147,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                 setActiveSettingsTab('controls');
                 setShowSettingsModal(true);
               }}
-              className="p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 bg-slate-800 border-white/10 text-slate-300"
+              className="p-2.5 sm:p-3.5 rounded-full border transition-all cursor-pointer hover:bg-slate-700 bg-slate-800 border-white/10 text-slate-300"
               title="Session Settings & Control Room"
             >
               <Settings className="w-4 h-4" />
@@ -3157,10 +3156,10 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
           <button
             onClick={() => setShowLeaveModal(true)}
-            className="p-3.5 bg-red-600 hover:bg-red-500 text-white rounded-full shadow-lg flex items-center justify-center cursor-pointer transition-all border border-red-500/40"
+            className="p-2.5 sm:p-3.5 bg-red-600 hover:bg-red-500 text-white rounded-full shadow-lg flex items-center justify-center cursor-pointer transition-all border border-red-500/40"
             title="Leave / Finish Session"
           >
-            <PhoneOff className="w-4.5 h-4.5" />
+            <PhoneOff className="w-4 h-4" />
           </button>
         </div>
 
