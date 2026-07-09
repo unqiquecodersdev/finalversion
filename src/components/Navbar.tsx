@@ -37,8 +37,8 @@ export const Navbar: React.FC<NavbarProps> = ({ user, onLogout, activeTab, setAc
         className="flex items-center gap-3 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded-xl"
         title="Go to Classrooms"
       >
-        <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-semibold shadow-[0_0_20px_rgba(79,70,229,0.4)] transition-all hover:scale-105 active:scale-95">
-          <BookOpen className="w-5 h-5 text-zinc-50" />
+        <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-semibold shadow-[0_0_20px_rgba(79,70,229,0.4)] transition-all hover:scale-105 active:scale-95 overflow-hidden">
+          <img src="/logo.png" alt="BetterClass Logo" className="w-full h-full object-cover" />
         </div>
       </button>
 

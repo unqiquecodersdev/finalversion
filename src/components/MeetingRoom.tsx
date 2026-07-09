@@ -561,7 +561,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     prevChatMessagesLengthRef.current = chatMessages.length;
   }, [chatMessages, chatOpen]);
 
-  // Google Meet Layout Settings
+  // BetterClass Layout Settings
   const [meetLayout, setMeetLayout] = useState<'grid' | 'sidebar' | 'spotlight'>('grid');
 
   // Screen Sharing State
@@ -3034,7 +3034,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
         {/* Main calling interactors */}
         <div className="flex items-center gap-1.5 sm:gap-3 flex-shrink-0">
-          {/* Google Meet inspired View Switcher buttons — hidden on very small screens */}
+          {/* BetterClass inspired View Switcher buttons — hidden on very small screens */}
           <div className="hidden sm:flex items-center bg-slate-950/60 rounded-full p-1 border border-white/5 gap-1 mr-1">
             <button
               onClick={() => setMeetLayout('grid')}
@@ -3043,7 +3043,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
                   ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/30' 
                   : 'text-slate-400 hover:text-white hover:bg-slate-800'
               }`}
-              title="Google Meet Grid View"
+              title="BetterClass Grid View"
             >
               <LayoutGrid className="w-4 h-4" />
             </button>
