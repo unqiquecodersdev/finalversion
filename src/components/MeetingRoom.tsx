@@ -198,7 +198,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     return rawParticipants.filter((p) => {
       if (!p.lastActive) return true;
       const diff = now - new Date(p.lastActive).getTime();
-      return diff <= 60000; // 60 seconds threshold (stale check for inactive participants)
+      // Allow up to 300 seconds (5 minutes) for clock skew and non-graceful disconnects
+      return diff <= 300000 && diff >= -300000; 
     });
   }, [rawParticipants, presenceTicker]);
 
@@ -289,6 +290,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     const currentLocalStream = localStreamRef.current;
     const currentScreenStream = screenStreamRef2.current;
 
+    const hasTracks = (currentLocalStream && currentLocalStream.getTracks().length > 0) || (currentScreenStream && currentScreenStream.getTracks().length > 0);
+
     if (currentLocalStream) {
       currentLocalStream.getTracks().forEach((track) => {
         try {
@@ -303,6 +306,15 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
           pc.addTrack(track, currentScreenStream);
         } catch (e) {}
       });
+    }
+
+    // Only add recvonly transceivers if we have NO local tracks to send.
+    // When addTrack() is called above, it already creates sendrecv transceivers.
+    // Adding recvonly ones before/after addTrack() creates duplicate mismatched
+    // transceivers that silently break camera/mic transmission for the remote peer.
+    if (!hasTracks) {
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+      pc.addTransceiver('video', { direction: 'recvonly' });
     }
 
     // Set up track handler immediately
@@ -1256,8 +1268,6 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
   // Initiator (lexicographically smaller UID) creates the offer; responder answers.
   // This eliminates offer-glare (both sides creating offers simultaneously).
   useEffect(() => {
-    if (!localStream) return;
-
     const unsubscribes: (() => void)[] = [];
 
     activeParticipants.forEach((p) => {
@@ -1681,10 +1691,18 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
 
   // ADJUST ATTENDANCE CHECKS SECONDS TIMELINE WHEN DEMO MODE OPTION TOGGLES
   useEffect(() => {
-    setNextPopupAtSecond(demoMode ? 15 : 600); // 15 seconds vs 10 minutes (600s)
-  }, [demoMode]);
+    if (demoMode) {
+      setNextPopupAtSecond(15); // 15 seconds in demo mode
+    } else {
+      // Use the teacher-configured activeStatusTimer (in minutes). Default 10 min (600s) if not set.
+      const configuredMins = meetingState?.activeStatusTimer && meetingState.activeStatusTimer > 0
+        ? meetingState.activeStatusTimer
+        : 10;
+      setNextPopupAtSecond(configuredMins * 60);
+    }
+  }, [demoMode, meetingState?.activeStatusTimer]);
 
-  // TRIGGER REAL-TIME ATTENDANCE POPUPS (after 10m then randomly each 5-7m, or highly accelerated in Demo Mode)
+  // TRIGGER REAL-TIME ATTENDANCE POPUPS (after configured interval, then randomly, or accelerated in Demo Mode)
   useEffect(() => {
     if (isHost) return;
     if (meetingState?.activeVerificationDisabled) {
@@ -1693,21 +1711,43 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({ meeting, user, onLeave
     }
 
     if (callDuration >= nextPopupAtSecond) {
+      // If a quiz is currently visible, DON'T show the popup — postpone it by the same interval
+      if (currentQuiz !== null) {
+        // Re-queue for a short time after quiz closes
+        const minDelay = demoMode ? 20 : 300;
+        const maxDelay = demoMode ? 35 : 420;
+        const nextDelay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+        setNextPopupAtSecond(callDuration + nextDelay);
+        return;
+      }
+
       // Prompt popup now
       setShowAvailabilityPopup(true);
       setPopupTimer(15);
       setPopupShown((prev) => prev + 1);
 
       // Determine the delay interval until the subsequent interactive check
-      // Demo: randomly every 20-35s. Standard: randomly every 5-7m (300 to 420 seconds)
-      const minDelay = demoMode ? 20 : 300;
-      const maxDelay = demoMode ? 35 : 420;
-      const nextDelay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+      // Demo: randomly every 20-35s. Standard: randomly matches configured timer ± 20%
+      const configuredMins = meetingState?.activeStatusTimer && meetingState.activeStatusTimer > 0
+        ? meetingState.activeStatusTimer
+        : (demoMode ? 0.5 : 10);
+      const baseDelay = demoMode ? 20 : configuredMins * 60;
+      const variance = demoMode ? 15 : Math.floor(configuredMins * 60 * 0.2);
+      const nextDelay = baseDelay + Math.floor(Math.random() * variance);
       setNextPopupAtSecond(callDuration + nextDelay);
     }
-  }, [callDuration, isHost, demoMode, nextPopupAtSecond, meetingState?.activeVerificationDisabled]);
+  }, [callDuration, isHost, demoMode, nextPopupAtSecond, meetingState?.activeVerificationDisabled, meetingState?.activeStatusTimer, currentQuiz]);
 
   // COUNT DOWN TIMERS FOR AVAILABILITY POPUPS
+  // Also dismiss the popup if a quiz opens mid-countdown (quiz takes priority)
+  useEffect(() => {
+    if (currentQuiz !== null && showAvailabilityPopup) {
+      // Quiz appeared while popup was visible — close popup and let it re-queue
+      setShowAvailabilityPopup(false);
+      return;
+    }
+  }, [currentQuiz, showAvailabilityPopup]);
+
   useEffect(() => {
     if (!showAvailabilityPopup) return;
 

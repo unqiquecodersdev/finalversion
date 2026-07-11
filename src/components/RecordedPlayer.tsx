@@ -106,7 +106,72 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
   const [progress, setProgress] = useState(0); // 0 to 100
   const [speed, setSpeed] = useState(1); // Playback multiplier helper
   const [muted, setMuted] = useState(false);
-  
+
+  // Time-based quiz trigger: fires a quiz every QUIZ_INTERVAL_SECONDS of actual playback
+  const QUIZ_INTERVAL_SECONDS = 60; // 1 minute of play time
+  const elapsedPlaySecondsRef = useRef(0);  // total seconds of video played
+  const lastQuizElapsedRef = useRef(0);     // elapsed seconds at which last quiz fired
+  const timeBasedQuizIndexRef = useRef(0);  // which quiz to show next (cycles)
+
+  // Dummy quiz pool for time-based triggers in recorded replay
+  const DUMMY_QUIZZES: QuizQuestion[] = [
+    {
+      question: "What is the primary benefit of engaging actively during a recorded class replay?",
+      options: [
+        "It reduces the total replay time",
+        "It improves retention by combining passive review with active verification",
+        "It automatically upgrades your attendance score without interaction",
+        "It allows the teacher to see your screen in real-time"
+      ],
+      correctAnswerIndex: 1,
+      category: "Active Learning"
+    },
+    {
+      question: "Which approach best describes effective asynchronous study?",
+      options: [
+        "Watching the full video once at maximum speed without pausing",
+        "Completing milestone quizzes and pausing to reflect on key concepts",
+        "Skipping to the end and only reviewing the summary slides",
+        "Relying on classmates to share their quiz answers later"
+      ],
+      correctAnswerIndex: 1,
+      category: "Study Habits"
+    },
+    {
+      question: "How does the BetterClass platform verify genuine engagement during replay?",
+      options: [
+        "By tracking mouse movement patterns throughout the session",
+        "Through timed interactive quiz checkpoints that require correct responses",
+        "By requiring the student to stay on the browser tab at all times",
+        "Via optional end-of-session summary forms"
+      ],
+      correctAnswerIndex: 1,
+      category: "Platform Mechanics"
+    },
+    {
+      question: "What happens to a student's participation score when they answer quiz checkpoints correctly?",
+      options: [
+        "It has no effect on their score",
+        "It is added to their recorded quiz performance and synced to the teacher's dashboard",
+        "It only affects the live-session grade, not the replay score",
+        "Scores are discarded after the replay session ends"
+      ],
+      correctAnswerIndex: 1,
+      category: "Scoring"
+    },
+    {
+      question: "Why is it important to complete quiz checkpoints within the replay session?",
+      options: [
+        "Checkpoints automatically expire and cannot be reattempted after the session",
+        "Completing them validates that the student engaged with the material and records accountability",
+        "They are optional bonuses with no impact on attendance",
+        "Only live-session checkpoints count toward the final grade"
+      ],
+      correctAnswerIndex: 1,
+      category: "Accountability"
+    }
+  ];
+
   // Quiz states
   const [currentQuiz, setCurrentQuiz] = useState<QuizQuestion | null>(null);
   const [quizTriggerIndex, setQuizTriggerIndex] = useState<number>(-1);
@@ -293,18 +358,29 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
     
     setProgress(currentProgress);
 
-    // Trigger milestone quiz popup checks (Only for students!)
-    if (!isTeacher && quizzes.length > 0) {
-      const currentMilestoneIndex = milestones.findIndex((m, idx) => {
-        return currentProgress >= m && idx === quizTriggerIndex + 1 && idx < quizzes.length;
-      });
+    // ── Time-based quiz trigger: fire a quiz every QUIZ_INTERVAL_SECONDS of play time ──
+    // Only for students, and only when no quiz is already active
+    if (!isTeacher && !currentQuiz && !replayFinished) {
+      // Calculate total elapsed playback seconds from video element's current time
+      // We approximate using currentTime which accumulates as the video plays.
+      const playedSecs = current;
+      const intervalsElapsed = Math.floor(playedSecs / QUIZ_INTERVAL_SECONDS);
+      const expectedQuizCount = intervalsElapsed; // number of quizzes that should have fired
 
-      if (currentMilestoneIndex !== -1) {
-        setPlaying(false);
-        setCurrentQuiz(quizzes[currentMilestoneIndex]);
-        setQuizTriggerIndex(currentMilestoneIndex);
+      if (expectedQuizCount > 0 && playedSecs - lastQuizElapsedRef.current >= QUIZ_INTERVAL_SECONDS) {
+        // Pick the quiz from the loaded quizzes or fall back to DUMMY_QUIZZES
+        const quizPool = quizzes.length > 0 ? quizzes : DUMMY_QUIZZES;
+        const qIdx = timeBasedQuizIndexRef.current % quizPool.length;
+        const quizToShow = quizPool[qIdx];
+
+        lastQuizElapsedRef.current = playedSecs;
+        timeBasedQuizIndexRef.current += 1;
+
+        setCurrentQuiz(quizToShow);
+        setQuizTriggerIndex(qIdx);
         setSelectedOption(null);
         setFeedbackShown(false);
+        setPlaying(false);
         if (videoRef.current) {
           videoRef.current.pause();
         }
@@ -381,6 +457,10 @@ export const RecordedPlayer: React.FC<RecordedPlayerProps> = ({ meeting, user, o
     setReplayFinished(false);
     setOverallScore(null);
     setPlaying(true);
+    // Reset time-based quiz tracking refs
+    elapsedPlaySecondsRef.current = 0;
+    lastQuizElapsedRef.current = 0;
+    timeBasedQuizIndexRef.current = 0;
   };
 
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
