@@ -56,9 +56,8 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
     return `${year}-${month}-${day}T${hours}:${minutes}`;
   });
   const [quizTimerInterval, setQuizTimerInterval] = useState<number>(5); // default interval (e.g. 5 minutes)
-  const [liveQuizGenerationInterval, setLiveQuizGenerationInterval] = useState<number>(5);
+  const [liveQuizGenerationEnabled, setLiveQuizGenerationEnabled] = useState(true);
   const [meetingDuration, setMeetingDuration] = useState<number>(60); // default class duration limit to 1 hour (max)
-  const [activeStatusTimer, setActiveStatusTimer] = useState<number>(10);
   const [isDragOver, setIsDragOver] = useState(false);
 
   // File parsing mechanics (Supports only .pdf, .pptx, .doc, .docx)
@@ -139,7 +138,7 @@ Key Vocabulary Definitions:
       const profiles: Record<string, UserProfile> = {};
       snapshot.forEach((snapDoc) => {
         const u = snapDoc.data() as UserProfile;
-        if (classroom.studentIds?.includes(u.uid)) {
+        if (classroom.studentIds.includes(u.uid)) {
           profiles[u.uid] = u;
         }
       });
@@ -162,15 +161,6 @@ Key Vocabulary Definitions:
       // Sort: scheduled/active first, then newest
       allMeets.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
       setMeetings(allMeets);
-
-      // Keep selectedMeeting in sync with latest Firestore status.
-      // Without this, selectedMeeting holds a stale snapshot and isActive stays
-      // true even after the host ends the class, keeping "Join Live" visible.
-      setSelectedMeeting((prev) => {
-        if (!prev) return prev;
-        const updated = allMeets.find((m) => m.id === prev.id);
-        return updated ?? prev;
-      });
     });
 
     return () => unsub();
@@ -221,9 +211,6 @@ Key Vocabulary Definitions:
       const data = await response.json();
       if (data.success && data.quizzes) {
         setGeneratedQuizzes(data.quizzes);
-        if (data.error) {
-          setQuizError(data.error);
-        }
       } else if (data.quizzes) {
         // Fallback set in backend
         setGeneratedQuizzes(data.quizzes);
@@ -276,7 +263,6 @@ Key Vocabulary Definitions:
         discussionMaterial: discussionMaterial.trim(),
         status: instantStart ? "active" : "scheduled",
         scheduledAt: instantStart ? new Date().toISOString() : (customScheduledAt || new Date().toISOString()),
-        startedAt: instantStart ? new Date().toISOString() : undefined,
         quizzes: generatedQuizzes.length > 0 ? generatedQuizzes : [
           {
             question: "How can students maximize attention during virtual meetings?",
@@ -295,16 +281,16 @@ Key Vocabulary Definitions:
         hostName: classroom.teacherName,
         createdAt: new Date().toISOString(),
         quizTriggerInterval: quizTimerInterval,
-        liveQuizGenerationEnabled: liveQuizGenerationInterval > 0,
-        activeVerificationDisabled: activeStatusTimer <= 0, // conditionally enabled
-        activeStatusTimer: activeStatusTimer,
+        liveQuizGenerationEnabled: liveQuizGenerationEnabled,
+        activeVerificationDisabled: false, // default to enabled, teacher can toggle in matching meeting side
         duration: meetingDuration,
-        liveQuizDisabled: quizTimerInterval <= 0,
-        liveQuizGenerationInterval: liveQuizGenerationInterval,
+        liveQuizDisabled: false,
       };
 
       if (instantStart) {
-        await setDoc(doc(db, "meetings", generatedMeetingId), newMeeting);
+        setDoc(doc(db, "meetings", generatedMeetingId), newMeeting).catch((err) => {
+          console.error("Failed creating meeting in background:", err);
+        });
 
         // Clean up variables
         setMeetTitle("");
@@ -326,9 +312,8 @@ Key Vocabulary Definitions:
         setShowScheduleForm(false);
         setShowScheduleModal(false);
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error("Failed creating meeting:", err);
-      setQuizError(err?.message || "Failed to create meeting. Please check database connection.");
     } finally {
       setSubmittingStatus(false);
     }
@@ -379,8 +364,8 @@ Key Vocabulary Definitions:
     }
   };
 
-  // Filter active meetings
-  const activeClassMeetings = meetings.filter(m => m.status === "active");
+  // Filter students
+  const activeClassMeetings = activeMeetings.filter(m => m.classroomId === classroom.id && m.status === "active");
 
   return (
     <div className="max-w-6xl mx-auto py-8 px-6 text-zinc-800">
@@ -520,60 +505,57 @@ Key Vocabulary Definitions:
                 </div>
 
                 {/* Automation & Quizzes Timers Configuration panel */}
-                <div className="p-4 bg-zinc-50 rounded-2xl border border-zinc-200 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="p-4 bg-zinc-50 rounded-2xl border border-zinc-200 grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div>
                     <label className="block text-[10px] font-bold uppercase tracking-widest text-indigo-600 mb-1.5 flex items-center gap-1.5">
-                      <Clock className="w-3.5 h-3.5" /> Quiz Showing Timer (Mins)
+                      <Clock className="w-3.5 h-3.5" /> Quiz Showing Timer
                     </label>
-                    <input
-                      type="number"
-                      min="0"
+                    <select
                       value={quizTimerInterval}
                       onChange={(e) => setQuizTimerInterval(Number(e.target.value))}
-                      placeholder="0 to disable"
                       className="w-full px-3 py-2 text-xs bg-white border border-zinc-200 rounded-xl focus:outline-none focus:border-indigo-500 text-zinc-800"
-                    />
+                    >
+                      <option value={1}>Show Quiz every 1 minute (Fast Demo)</option>
+                      <option value={3}>Show Quiz every 3 minutes</option>
+                      <option value={5}>Show Quiz every 5 minutes (Standard)</option>
+                      <option value={10}>Show Quiz every 10 minutes</option>
+                      <option value={15}>Show Quiz every 15 minutes</option>
+                      <option value={20}>Show Quiz every 20 minutes</option>
+                    </select>
                   </div>
 
                   <div>
                     <label className="block text-[10px] font-bold uppercase tracking-widest text-indigo-600 mb-1.5 flex items-center gap-1.5">
-                      <Clock className="w-3.5 h-3.5 text-indigo-600" /> Class Duration Limit (Mins)
+                      <Clock className="w-3.5 h-3.5 text-indigo-600" /> Class Duration Limit
                     </label>
-                    <input
-                      type="number"
-                      min="1"
+                    <select
                       value={meetingDuration}
                       onChange={(e) => setMeetingDuration(Number(e.target.value))}
                       className="w-full px-3 py-2 text-xs bg-white border border-zinc-200 rounded-xl focus:outline-none focus:border-indigo-500 text-zinc-800"
-                    />
-                  </div>
-                  
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase tracking-widest text-indigo-600 mb-1.5 flex items-center gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 animate-pulse" /> AI Discussion Quiz (Mins)
-                    </label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={liveQuizGenerationInterval}
-                      onChange={(e) => setLiveQuizGenerationInterval(Number(e.target.value))}
-                      placeholder="0 to disable"
-                      className="w-full px-3 py-2 text-xs bg-white border border-zinc-200 rounded-xl focus:outline-none focus:border-indigo-500 text-zinc-800"
-                    />
+                    >
+                      <option value={5}>5 Minutes (Demo limit)</option>
+                      <option value={15}>15 Minutes</option>
+                      <option value={30}>30 Minutes</option>
+                      <option value={45}>45 Minutes</option>
+                      <option value={60}>60 Minutes (Max Limit)</option>
+                    </select>
                   </div>
 
                   <div>
-                    <label className="block text-[10px] font-bold uppercase tracking-widest text-indigo-600 mb-1.5 flex items-center gap-1.5">
-                      <AlertCircle className="w-3.5 h-3.5 text-indigo-600" /> Active Status Timer (Mins)
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-indigo-600 mb-2 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 animate-pulse" /> AI Live Discussions Quiz
                     </label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={activeStatusTimer}
-                      onChange={(e) => setActiveStatusTimer(Number(e.target.value))}
-                      placeholder="0 to disable"
-                      className="w-full px-3 py-2 text-xs bg-white border border-zinc-200 rounded-xl focus:outline-none focus:border-indigo-500 text-zinc-800"
-                    />
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={liveQuizGenerationEnabled}
+                        onChange={(e) => setLiveQuizGenerationEnabled(e.target.checked)}
+                        className="w-4 h-4 rounded text-indigo-600 bg-white border-zinc-300 focus:ring-indigo-500 focus:ring-2 focus:ring-offset-white"
+                      />
+                      <span className="text-xs text-zinc-600 leading-tight">
+                        Generate quizzes dynamically from discussion transcript/chat
+                      </span>
+                    </label>
                   </div>
                 </div>
 
@@ -602,52 +584,20 @@ Key Vocabulary Definitions:
                 )}
 
                 {generatedQuizzes.length > 0 && (
-                  <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl max-h-[300px] overflow-y-auto space-y-3.5 text-zinc-850">
+                  <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl max-h-[220px] overflow-y-auto space-y-3.5 text-zinc-850">
                     <h4 className="text-[11px] font-mono tracking-wider font-semibold text-emerald-700 uppercase flex items-center gap-1.5">
-                      <Check className="w-3.5 h-3.5" /> AI Generated Quizzes Preview ({generatedQuizzes.length}) - Editable
+                      <Check className="w-3.5 h-3.5" /> AI Generated Quizzes Preview ({generatedQuizzes.length})
                     </h4>
                     {generatedQuizzes.map((q, idx) => (
-                      <div key={idx} className="text-xs border-b border-zinc-150 pb-4 last:border-none last:pb-0 space-y-2">
-                        <div className="flex flex-col gap-1">
-                          <span className="font-bold text-zinc-800">Q{idx + 1}:</span>
-                          <input 
-                            type="text"
-                            value={q.question}
-                            onChange={(e) => {
-                              const newQuizzes = [...generatedQuizzes];
-                              newQuizzes[idx].question = e.target.value;
-                              setGeneratedQuizzes(newQuizzes);
-                            }}
-                            className="w-full px-2.5 py-1.5 bg-white border border-emerald-200 rounded focus:outline-none focus:border-emerald-500 text-zinc-800"
-                          />
-                        </div>
-                        <div className="grid grid-cols-2 gap-2 mt-2">
+                      <div key={idx} className="text-xs border-b border-zinc-150 pb-3 last:border-none last:pb-0">
+                        <span className="font-bold text-zinc-800">Q{idx + 1}: {q.question}</span>
+                        <ul className="grid grid-cols-2 gap-1.5 mt-2 pl-3 list-disc text-zinc-500 font-mono text-[11px]">
                           {q.options.map((o, oIdx) => (
-                            <div key={oIdx} className="flex items-center gap-2">
-                              <input 
-                                type="radio" 
-                                name={`correct-${idx}`} 
-                                checked={oIdx === q.correctAnswerIndex}
-                                onChange={() => {
-                                  const newQuizzes = [...generatedQuizzes];
-                                  newQuizzes[idx].correctAnswerIndex = oIdx;
-                                  setGeneratedQuizzes(newQuizzes);
-                                }}
-                                className="w-3.5 h-3.5 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
-                              />
-                              <input 
-                                type="text"
-                                value={o}
-                                onChange={(e) => {
-                                  const newQuizzes = [...generatedQuizzes];
-                                  newQuizzes[idx].options[oIdx] = e.target.value;
-                                  setGeneratedQuizzes(newQuizzes);
-                                }}
-                                className={`w-full px-2 py-1.5 bg-white border rounded focus:outline-none text-[11px] font-mono ${oIdx === q.correctAnswerIndex ? "border-emerald-400 font-bold text-emerald-800" : "border-emerald-100 text-zinc-600 focus:border-emerald-300"}`}
-                              />
-                            </div>
+                            <li key={oIdx} className={oIdx === q.correctAnswerIndex ? "text-emerald-700 font-bold" : ""}>
+                              {o}
+                            </li>
                           ))}
-                        </div>
+                        </ul>
                       </div>
                     ))}
                   </div>
@@ -719,7 +669,7 @@ Key Vocabulary Definitions:
                       • Quizzes scheduled dynamically every <strong className="text-indigo-700 font-mono">{quizTimerInterval} min</strong>.
                     </p>
                     <p className="text-zinc-600">
-                      • AI Live Discussion Quiz: <strong className={liveQuizGenerationInterval > 0 ? "text-emerald-700" : "text-amber-700 font-bold"}>{liveQuizGenerationInterval > 0 ? "Enabled" : "Disabled"}</strong>.
+                      • AI Live Discussion Quiz: <strong className={liveQuizGenerationEnabled ? "text-emerald-700" : "text-amber-700 font-bold"}>{liveQuizGenerationEnabled ? "Enabled" : "Disabled"}</strong>.
                     </p>
                   </div>
 
@@ -833,10 +783,9 @@ Key Vocabulary Definitions:
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
-                                const startedAt = new Date().toISOString();
-                                const updated = { ...m, status: "active" as const, startedAt };
+                                const updated = { ...m, status: "active" as const };
                                 onStartMeeting(updated);
-                                updateDoc(doc(db, "meetings", m.id), { status: "active", startedAt }).catch((err) => {
+                                updateDoc(doc(db, "meetings", m.id), { status: "active" }).catch((err) => {
                                   console.error("Failed to activate meeting:", err);
                                 });
                               }}
@@ -870,15 +819,15 @@ Key Vocabulary Definitions:
                   <span className="text-zinc-400 font-mono text-[10px]">Platform registered students</span>
                 </div>
                 <span className="w-7 h-7 bg-indigo-50 rounded-lg flex items-center justify-center font-bold font-mono text-indigo-600 border border-indigo-100">
-                  {classroom.studentIds?.length || 0}
+                  {classroom.studentIds.length}
                 </span>
               </div>
 
-              {(classroom.studentIds?.length || 0) === 0 ? (
+              {classroom.studentIds.length === 0 ? (
                 <p className="text-[11px] text-zinc-400 font-mono text-center py-4">No students have joined this classroom code yet.</p>
               ) : (
                 <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1">
-                  {(classroom.studentIds || []).map((sid, index) => {
+                  {classroom.studentIds.map((sid, index) => {
                     const prof = studentProfiles[sid];
                     return (
                       <div key={sid} className="p-2.5 bg-zinc-50/50 rounded-xl border border-zinc-200/60 flex items-center justify-between text-xs transition-colors hover:bg-zinc-50">

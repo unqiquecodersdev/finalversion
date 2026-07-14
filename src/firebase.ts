@@ -4,9 +4,7 @@ import {
   signInWithEmailAndPassword as fbSignIn,
   createUserWithEmailAndPassword as fbCreateUser,
   signOut as fbSignOut,
-  onAuthStateChanged as fbOnAuthStateChanged,
-  setPersistence,
-  indexedDBLocalPersistence
+  onAuthStateChanged as fbOnAuthStateChanged
 } from "firebase/auth";
 import { 
   getFirestore, 
@@ -26,12 +24,6 @@ import firebaseConfig from "../firebase-applet-config.json";
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
-
-// Use IndexedDB for auth persistence — survives cookie/localStorage clears
-// since IndexedDB is stored separately from cookies and localStorage.
-setPersistence(auth, indexedDBLocalPersistence).catch((err) => {
-  console.warn("Failed to set IndexedDB auth persistence, falling back to default:", err);
-});
 
 // AUTH ACTIONS RE-EXPORT
 export const signInWithEmailAndPassword = fbSignIn;

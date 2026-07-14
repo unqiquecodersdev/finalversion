@@ -13,7 +13,6 @@ export interface Classroom {
   name: string;
   description: string;
   teacherId: string;
-  teacherEmail?: string; // used to repair stale teacherIds across sessions
   teacherName: string;
   code: string;
   studentIds: string[];
@@ -35,7 +34,6 @@ export interface Meeting {
   description: string;
   discussionMaterial: string;
   scheduledAt?: string;
-  startedAt?: string;
   status: "scheduled" | "active" | "ended";
   quizzes: QuizQuestion[];
   recordedQuizzes: QuizQuestion[];
@@ -46,10 +44,8 @@ export interface Meeting {
   quizTriggerInterval?: number;
   liveQuizGenerationEnabled?: boolean;
   activeVerificationDisabled?: boolean;
-  activeStatusTimer?: number;
   duration?: number;
   liveQuizDisabled?: boolean;
-  liveQuizGenerationInterval?: number;
   recordedVideoUrl?: string;
   screenShareBy?: string | null;
   screenShareByName?: string | null;
